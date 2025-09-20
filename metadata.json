@@ -1,0 +1,5 @@
+{
+  "name": "getmycreative",
+  "description": "A Pinterest-style feed of creative templates. With getmycreative, users can upload their logo, product images, and text to generate customized, on-brand creatives using the Gemini API.",
+  "requestFramePermissions": []
+}

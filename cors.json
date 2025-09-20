@@ -1,0 +1,12 @@
+[
+  {
+    "origin": [
+      "https://getmycreative-902717706592.us-west1.run.app",
+      "http://localhost:5173",
+      "https://localhost:5173"
+    ],
+    "method": ["GET", "HEAD", "POST", "PUT", "OPTIONS"],
+    "responseHeader": ["Content-Type", "Content-Range", "X-Goog-Resumable", "Authorization"],
+    "maxAgeSeconds": 3600
+  }
+]
