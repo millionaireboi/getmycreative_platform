@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, MouseEvent } from 'react';
+import React, { useState, useEffect, useRef, MouseEvent, useCallback } from 'react';
 import { Template, Mark, TemplateStatus } from '../core/types/index.ts';
 import { UITemplate } from '../types.ts';
 import { updateTemplate } from '../core/systems/templateStore.ts';
@@ -51,15 +51,44 @@ export const TemplateEditorView = ({ template, onBack }: { template: UITemplate,
     const [drawingType, setDrawingType] = useState<DrawingType>('text');
     const [drawingStart, setDrawingStart] = useState<{ x: number, y: number } | null>(null);
     const [currentDrawing, setCurrentDrawing] = useState<{ x: number, y: number, width: number, height: number } | null>(null);
-    
+
     const [isSaving, setIsSaving] = useState(false);
     const [isAnalyzing, setIsAnalyzing] = useState(false);
     
     const imageContainerRef = useRef<HTMLDivElement>(null);
+    const imageElementRef = useRef<HTMLImageElement>(null);
+    const [imageBounds, setImageBounds] = useState({ left: 0, top: 0, width: 0, height: 0 });
     const isDraggingRef = useRef(false);
     const resizeInfoRef = useRef<{ markId: string; handle: ResizeHandle } | null>(null);
     const resizeBoundsRef = useRef<{ left: number; top: number; right: number; bottom: number } | null>(null);
     const dragStartPosRef = useRef({ x: 0, y: 0 });
+
+    const updateImageBounds = useCallback(() => {
+        if (!imageContainerRef.current || !imageElementRef.current) return;
+        const containerRect = imageContainerRef.current.getBoundingClientRect();
+        const imageRect = imageElementRef.current.getBoundingClientRect();
+        setImageBounds({
+            left: imageRect.left - containerRect.left,
+            top: imageRect.top - containerRect.top,
+            width: imageRect.width,
+            height: imageRect.height,
+        });
+    }, []);
+
+    const getNormalizedPoint = useCallback((event: MouseEvent<HTMLDivElement>) => {
+        if (!imageElementRef.current) return null;
+        const rect = imageElementRef.current.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return null;
+        const x = (event.clientX - rect.left) / rect.width;
+        const y = (event.clientY - rect.top) / rect.height;
+        if (x < 0 || x > 1 || y < 0 || y > 1) {
+            return null;
+        }
+        return {
+            x: clamp(x, 0, 1),
+            y: clamp(y, 0, 1),
+        };
+    }, []);
 
     useEffect(() => {
         setTitle(template.title);
@@ -68,7 +97,23 @@ export const TemplateEditorView = ({ template, onBack }: { template: UITemplate,
         setCategory(template.category || '');
         setMarks(template.initialMarks || []);
         setUseCases(template.useCases || []);
-    }, [template]);
+        requestAnimationFrame(() => updateImageBounds());
+    }, [template, updateImageBounds]);
+
+    useEffect(() => {
+        const frame = requestAnimationFrame(() => updateImageBounds());
+        window.addEventListener('resize', updateImageBounds);
+        let observer: ResizeObserver | null = null;
+        if (typeof ResizeObserver !== 'undefined' && imageContainerRef.current) {
+            observer = new ResizeObserver(() => updateImageBounds());
+            observer.observe(imageContainerRef.current);
+        }
+        return () => {
+            cancelAnimationFrame(frame);
+            window.removeEventListener('resize', updateImageBounds);
+            observer?.disconnect();
+        };
+    }, [updateImageBounds]);
 
     const handleTagToggle = (tag: string) => {
         setTags(prev => prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag]);
@@ -140,33 +185,40 @@ export const TemplateEditorView = ({ template, onBack }: { template: UITemplate,
     };
 
     const handleMouseDown = (e: MouseEvent<HTMLDivElement>) => {
-        if (!imageContainerRef.current) return;
-        const rect = imageContainerRef.current.getBoundingClientRect();
-        const x = (e.clientX - rect.left) / rect.width;
-        const y = (e.clientY - rect.top) / rect.height;
+        const point = getNormalizedPoint(e);
+        if (!point) {
+            setSelectedMarkId(null);
+            return;
+        }
 
         if (interactionMode === 'drawing') {
-            setDrawingStart({ x, y });
+            setDrawingStart(point);
             return;
         }
 
         const clickedMark = marks.find(mark => {
-            const markX = mark.x - (mark.width || 0) / 2;
-            const markY = mark.y - (mark.height || 0) / 2;
-            return x >= markX && x <= markX + (mark.width || 0) && y >= markY && y <= markY + (mark.height || 0);
+            const halfWidth = (mark.width || 0) / 2;
+            const halfHeight = (mark.height || 0) / 2;
+            return (
+                point.x >= mark.x - halfWidth &&
+                point.x <= mark.x + halfWidth &&
+                point.y >= mark.y - halfHeight &&
+                point.y <= mark.y + halfHeight
+            );
         });
         
         setSelectedMarkId(clickedMark?.id || null);
 
         if (clickedMark) {
             isDraggingRef.current = true;
-            dragStartPosRef.current = { x: x - clickedMark.x, y: y - clickedMark.y };
+            dragStartPosRef.current = { x: point.x - clickedMark.x, y: point.y - clickedMark.y };
         }
     };
     
     const handleMouseMove = (e: MouseEvent<HTMLDivElement>) => {
-        if (!imageContainerRef.current) return;
-        const rect = imageContainerRef.current.getBoundingClientRect();
+        if (!imageElementRef.current) return;
+        const rect = imageElementRef.current.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return;
         const rawX = (e.clientX - rect.left) / rect.width;
         const rawY = (e.clientY - rect.top) / rect.height;
         const clampedX = clamp(rawX, 0, 1);
@@ -342,43 +394,64 @@ export const TemplateEditorView = ({ template, onBack }: { template: UITemplate,
                     className="flex-1 bg-slate-200 p-8 flex items-center justify-center relative select-none"
                 >
                     <img 
+                        ref={imageElementRef}
                         src={template.imageUrl} 
                         alt="Template Preview"
                         className="max-w-full max-h-full object-contain shadow-lg"
                         draggable="false"
+                        onLoad={updateImageBounds}
                     />
-                    {/* Render Marks */}
-                    {marks.map(mark => {
-                        const style = {
-                            left: `${(mark.x - (mark.width || 0) / 2) * 100}%`,
-                            top: `${(mark.y - (mark.height || 0) / 2) * 100}%`,
-                            width: `${(mark.width || 0) * 100}%`,
-                            height: `${(mark.height || 0) * 100}%`,
-                        };
-                        const isSelected = selectedMarkId === mark.id;
-                        return (
-                             <div key={mark.id} style={style} className={`absolute border-2 transition-colors ${isSelected ? 'border-emerald-500 bg-emerald-500/20' : 'border-dashed border-white/80 hover:bg-white/20'}`}>
-                                <span className="absolute -top-5 left-0 text-xs bg-white/80 text-black px-1.5 py-0.5 rounded-full">{mark.label}</span>
-                                {isSelected && <button onClick={() => removeMark(mark.id)} className="absolute -top-2 -right-2 p-0.5 bg-red-500 text-white rounded-full hover:bg-red-600"><TrashIcon className="w-3 h-3"/></button>}
-                                {isSelected && RESIZE_HANDLES.map(handle => (
+                    {imageBounds.width > 0 && imageBounds.height > 0 && (
+                        <div
+                            className="absolute pointer-events-none"
+                            style={{
+                                left: imageBounds.left,
+                                top: imageBounds.top,
+                                width: imageBounds.width,
+                                height: imageBounds.height,
+                            }}
+                        >
+                            {/* Render Marks */}
+                            {marks.map(mark => {
+                                const style = {
+                                    left: `${(mark.x - (mark.width || 0) / 2) * 100}%`,
+                                    top: `${(mark.y - (mark.height || 0) / 2) * 100}%`,
+                                    width: `${(mark.width || 0) * 100}%`,
+                                    height: `${(mark.height || 0) * 100}%`,
+                                };
+                                const isSelected = selectedMarkId === mark.id;
+                                return (
                                     <div
-                                        key={`${mark.id}-${handle}`}
-                                        onMouseDown={event => handleResizeMouseDown(event, mark.id, handle)}
-                                        className={`${HANDLE_POSITION_CLASSES[handle]} bg-white border border-emerald-500 rounded-full shadow pointer-events-auto`}
-                                        style={{ width: RESIZE_HANDLE_SIZE, height: RESIZE_HANDLE_SIZE }}
-                                    />
-                                ))}
-                            </div>
-                        )
-                    })}
-                     {/* Render Current Drawing */}
-                    {currentDrawing && (
-                         <div style={{
-                            left: `${currentDrawing.x * 100}%`,
-                            top: `${currentDrawing.y * 100}%`,
-                            width: `${currentDrawing.width * 100}%`,
-                            height: `${currentDrawing.height * 100}%`,
-                         }} className="absolute border-2 border-emerald-500 bg-emerald-500/20 pointer-events-none" />
+                                        key={mark.id}
+                                        style={style}
+                                        className={`absolute border-2 transition-colors pointer-events-auto ${isSelected ? 'border-emerald-500 bg-emerald-500/20' : 'border-dashed border-white/80 hover:bg-white/20'}`}
+                                    >
+                                        <span className="absolute -top-5 left-0 text-xs bg-white/80 text-black px-1.5 py-0.5 rounded-full">{mark.label}</span>
+                                        {isSelected && <button onClick={() => removeMark(mark.id)} className="absolute -top-2 -right-2 p-0.5 bg-red-500 text-white rounded-full hover:bg-red-600"><TrashIcon className="w-3 h-3"/></button>}
+                                        {isSelected && RESIZE_HANDLES.map(handle => (
+                                            <div
+                                                key={`${mark.id}-${handle}`}
+                                                onMouseDown={event => handleResizeMouseDown(event, mark.id, handle)}
+                                                className={`${HANDLE_POSITION_CLASSES[handle]} bg-white border border-emerald-500 rounded-full shadow pointer-events-auto`}
+                                                style={{ width: RESIZE_HANDLE_SIZE, height: RESIZE_HANDLE_SIZE }}
+                                            />
+                                        ))}
+                                    </div>
+                                );
+                            })}
+                            {/* Render Current Drawing */}
+                            {currentDrawing && (
+                                <div
+                                    style={{
+                                        left: `${currentDrawing.x * 100}%`,
+                                        top: `${currentDrawing.y * 100}%`,
+                                        width: `${currentDrawing.width * 100}%`,
+                                        height: `${currentDrawing.height * 100}%`,
+                                    }}
+                                    className="absolute border-2 border-emerald-500 bg-emerald-500/20 pointer-events-none"
+                                />
+                            )}
+                        </div>
                     )}
 
                     <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-white/80 backdrop-blur-sm rounded-lg shadow-md p-2 flex gap-2">

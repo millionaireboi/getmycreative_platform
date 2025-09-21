@@ -1,8 +1,8 @@
-import { useState, useCallback, useEffect, ChangeEvent, FormEvent, useRef, MouseEvent, useMemo } from 'react';
+import { useState, useCallback, useEffect, ChangeEvent, FormEvent, useRef, MouseEvent, useMemo, MutableRefObject } from 'react';
 import { UITemplate, BrandAsset, GeneratedImage, Mark, ChatMessage } from '../types.ts';
 import { generateCreative, editCreativeWithChat, ChatEditOptions } from '../services/geminiService.ts';
 import { fileToBase64, downloadImage, imageUrlToBase64, base64ToBlob } from '../utils/fileUtils.ts';
-import { SparklesIcon, ArrowLeftIcon, DownloadIcon, PaperclipIcon, SendIcon, SettingsIcon, PaletteIcon, XIcon, UploadCloudIcon, TrashIcon, EditIcon } from './icons.tsx';
+import { SparklesIcon, ArrowLeftIcon, DownloadIcon, PaperclipIcon, SendIcon, PaletteIcon, XIcon, UploadCloudIcon, TrashIcon, EditIcon } from './icons.tsx';
 import { BRAND_PALETTES } from '../constants.ts';
 import { useAuth } from '../contexts/AuthContext.tsx';
 import { SubscriptionTier, Project } from '../core/types/index.ts';
@@ -10,21 +10,16 @@ import { createProject, updateProjectHistory, updateProjectName } from '../core/
 import { uploadFileToStorage } from '../firebase/config.ts';
 
 
-const buildChatMessagesForState = (isProUser: boolean, includeForm: boolean): ChatMessage[] => {
-    const messages: ChatMessage[] = [];
-    if (includeForm) {
-        messages.push({ id: 'msg-form', role: 'assistant', type: 'form' });
-    }
-    messages.push({
+const buildChatMessagesForState = (isProUser: boolean): ChatMessage[] => [
+    {
         id: 'msg-tip',
         role: 'assistant',
         type: 'text',
         text: isProUser
             ? "Tip: use @ to reference any enabled hotspot (e.g. @Headline) when you ask for changes."
             : "Upgrade to Pro to chat with the designer bot and request targeted tweaks using @mentions."
-    });
-    return messages;
-};
+    }
+];
 
 const VersionHistory = ({ history, activeIndex, onSelect }: { history: GeneratedImage[], activeIndex: number, onSelect: (index: number) => void }) => (
     <div>
@@ -107,7 +102,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const [enabledMarks, setEnabledMarks] = useState<Record<string, boolean>>(() => {
     const map: Record<string, boolean> = {};
     initialMarksSource.forEach(mark => {
-        map[mark.id] = true;
+        map[mark.id] = false;
     });
     return map;
   });
@@ -139,9 +134,10 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     });
     return map;
   });
-  const isNewProject = !project || initialHistory.length === 1;
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => buildChatMessagesForState(!!isProUser, isNewProject));
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => buildChatMessagesForState(!!isProUser));
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isGenerationConfirmOpen, setIsGenerationConfirmOpen] = useState(false);
+  const [pendingExcludedMarks, setPendingExcludedMarks] = useState<Mark[]>([]);
 
   const [chatPrompt, setChatPrompt] = useState('');
   const [chatAttachment, setChatAttachment] = useState<BrandAsset | null>(null);
@@ -154,6 +150,10 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
   const [activeHotspotId, setActiveHotspotId] = useState<string | null>(null);
   const [isChatDrawerOpen, setIsChatDrawerOpen] = useState(false);
+
+  const [showHotspotOverlay, setShowHotspotOverlay] = useState(true);
+  const [isDrawingMark, setIsDrawingMark] = useState(false);
+  const [draftMark, setDraftMark] = useState<Mark | null>(null);
 
   const [basePrompt, setBasePrompt] = useState(initialPrompt);
   const [templateImageUrl, setTemplateImageUrl] = useState(initialTemplateImageUrl);
@@ -180,7 +180,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setEnabledMarks(() => {
         const map: Record<string, boolean> = {};
         sourceMarks.forEach(mark => {
-            map[mark.id] = true;
+            map[mark.id] = false;
         });
         return map;
     });
@@ -238,16 +238,54 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const hasMountedRef = useRef(false);
-  const formFieldsRef = useRef<Record<string, HTMLDivElement>>({});
   const imagePreviewRef = useRef<HTMLDivElement>(null);
+  const imageElementRef = useRef<HTMLImageElement>(null);
+  const [imageBounds, setImageBounds] = useState({ left: 0, top: 0, width: 0, height: 0 });
   const nameInputRef = useRef<HTMLInputElement>(null);
   const chatTextAreaRef = useRef<HTMLTextAreaElement>(null);
+  const canvasHotspotRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const lastFocusedHotspotIdRef = useRef<string | null>(null);
+  const drawStartRef = useRef<{ x: number; y: number; id: string; label: string } | null>(null);
+  const drawerIncludeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const drawerTextAreaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const updateImageBounds = useCallback(() => {
+    if (!imagePreviewRef.current || !imageElementRef.current) return;
+    const containerRect = imagePreviewRef.current.getBoundingClientRect();
+    const imageRect = imageElementRef.current.getBoundingClientRect();
+    setImageBounds({
+      left: imageRect.left - containerRect.left,
+      top: imageRect.top - containerRect.top,
+      width: imageRect.width,
+      height: imageRect.height,
+    });
+  }, []);
 
   const activeImageUrl = history[activeIndex]?.imageUrl || templateImageUrl;
   const activeMark = useMemo(() => {
     if (!activeHotspotId) return null;
     return marks.find(m => m.id === activeHotspotId) || null;
   }, [activeHotspotId, marks]);
+
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => updateImageBounds());
+    return () => cancelAnimationFrame(frame);
+  }, [activeImageUrl, updateImageBounds]);
+
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => updateImageBounds());
+    window.addEventListener('resize', updateImageBounds);
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined' && imagePreviewRef.current) {
+      observer = new ResizeObserver(() => updateImageBounds());
+      observer.observe(imagePreviewRef.current);
+    }
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener('resize', updateImageBounds);
+      observer?.disconnect();
+    };
+  }, [updateImageBounds]);
 
   const hydrateFromTemplate = useCallback((template: UITemplate) => {
     const templateHistory: GeneratedImage[] = [{ id: template.id, imageUrl: template.imageUrl, prompt: 'Original Template' }];
@@ -272,7 +310,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setActiveHotspotId(null);
     setHoveredMarkId(null);
     setIsPlacingMark(null);
-    setChatMessages(buildChatMessagesForState(!!isProUser, true));
+    setChatMessages(buildChatMessagesForState(!!isProUser));
     lastHydratedRef.current = { projectId: null, templateId: template.id };
   }, [applyMarksFromSource, closeMentionSuggestions, isProUser]);
 
@@ -301,7 +339,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setActiveHotspotId(null);
     setHoveredMarkId(null);
     setIsPlacingMark(null);
-    setChatMessages(buildChatMessagesForState(!!isProUser, false));
+    setChatMessages(buildChatMessagesForState(!!isProUser));
     lastHydratedRef.current = { projectId: source.id, templateId: null };
   }, [applyMarksFromSource, closeMentionSuggestions, isProUser]);
 
@@ -329,21 +367,13 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   }, [project, pendingTemplate, hydrateFromProject, hydrateFromTemplate]);
 
   useEffect(() => {
-    const lastMessage = chatMessages[chatMessages.length - 1];
     if (!hasMountedRef.current) {
       hasMountedRef.current = true;
       return;
     }
-    if (isGenerating || (lastMessage && lastMessage.type !== 'form')) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages, isGenerating]);
 
-  useEffect(() => {
-    if (hoveredMarkId) {
-      formFieldsRef.current[hoveredMarkId]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    }
-  }, [hoveredMarkId]);
   
   useEffect(() => {
     if (isEditingName) {
@@ -372,6 +402,28 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         window.removeEventListener('keydown', handleKeyDown);
     };
   }, [activeMark]);
+
+  useEffect(() => {
+    if (!activeMark) {
+        drawerIncludeButtonRef.current = null;
+        drawerTextAreaRef.current = null;
+        return;
+    }
+    const activeMode = imageModes[activeMark.id] || 'upload';
+    if (activeMark.type === 'text' || (activeMark.type === 'image' && activeMode === 'describe')) {
+        drawerTextAreaRef.current?.focus();
+    } else {
+        drawerIncludeButtonRef.current?.focus();
+    }
+  }, [activeMark, imageModes]);
+
+  useEffect(() => {
+    if (!activeHotspotId && lastFocusedHotspotIdRef.current) {
+        const ref = canvasHotspotRefs.current[lastFocusedHotspotIdRef.current];
+        ref?.focus();
+        lastFocusedHotspotIdRef.current = null;
+    }
+  }, [activeHotspotId]);
 
   const ensureProjectPersisted = useCallback(async (updatedHistory: GeneratedImage[]) => {
     if (!appUser) return null;
@@ -403,16 +455,22 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     }
   }, [appUser, persistedProjectId, onProjectPersisted, projectName]);
 
-  const handleGenerateFromForm = useCallback(async () => {
+  const executeGeneration = useCallback(async () => {
     if (!appUser) return;
+    setIsGenerationConfirmOpen(false);
+    setPendingExcludedMarks([]);
     setIsGenerating(true);
     setIsChatDrawerOpen(true);
     setChatMessages(prev => prev.filter(m => m.type !== 'error'));
 
-    const userMessage: ChatMessage = { id: `msg-${Date.now()}`, role: 'user', type: 'text', text: 'Generate the creative with the details I provided in the form.' };
+    const userMessage: ChatMessage = {
+        id: `msg-${Date.now()}`,
+        role: 'user',
+        type: 'text',
+        text: 'Generate the creative with the hotspots I selected.'
+    };
     setChatMessages(prev => {
-        const withoutForm = prev.filter(m => m.type !== 'form');
-        const withoutTip = withoutForm.filter(m => m.id !== 'msg-tip');
+        const withoutTip = prev.filter(m => m.id !== 'msg-tip');
         return [...withoutTip, userMessage];
     });
 
@@ -462,6 +520,17 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     }
   }, [appUser, ensureProjectPersisted, templateImageUrl, basePrompt, textFields, imageAssets, imagePrompts, imageModes, enabledMarks, aspectRatio, marks, originalMarks, history]);
 
+  const handleGenerateClick = useCallback(() => {
+    if (isGenerating || isDemoMode) return;
+    const excluded = marks.filter(mark => !enabledMarks[mark.id]);
+    if (excluded.length > 0) {
+        setPendingExcludedMarks(excluded);
+        setIsGenerationConfirmOpen(true);
+        return;
+    }
+    executeGeneration();
+  }, [isGenerating, isDemoMode, marks, enabledMarks, executeGeneration]);
+
   const handleChatEdit = async (e: FormEvent) => {
     e.preventDefault();
     if (!chatPrompt.trim() || isGenerating || !isProUser || !appUser) return;
@@ -476,7 +545,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setIsChatDrawerOpen(true);
     const isFirstGeneration = history.length === 1;
     if (isFirstGeneration) {
-        setChatMessages(prev => prev.filter(m => m.type !== 'form' && m.id !== 'msg-tip'));
+        setChatMessages(prev => prev.filter(m => m.id !== 'msg-tip'));
     }
 
     const userMessage: ChatMessage = { id: `msg-${Date.now()}`, role: 'user', type: 'text', text: chatPrompt, referenceImagePreviewUrl: chatAttachment?.previewUrl };
@@ -553,34 +622,107 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     }
   };
   
-  const handleImageClick = (e: MouseEvent<HTMLDivElement>) => {
-    if (!isPlacingMark || !imagePreviewRef.current) return;
+  const getNormalizedPoint = (event: MouseEvent<HTMLDivElement>) => {
+    if (!imageElementRef.current) return null;
+    const rect = imageElementRef.current.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+    const x = (event.clientX - rect.left) / rect.width;
+    const y = (event.clientY - rect.top) / rect.height;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+    return {
+        x: Math.min(1, Math.max(0, x)),
+        y: Math.min(1, Math.max(0, y))
+    };
+  };
 
-    const rect = imagePreviewRef.current.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / rect.width;
-    const y = (e.clientY - rect.top) / rect.height;
-    
-    const newMarkId = `${isPlacingMark}-${Date.now()}`;
+  const cancelDraftMark = () => {
+    setIsDrawingMark(false);
+    setDraftMark(null);
+    drawStartRef.current = null;
+  };
+
+  const handleCanvasMouseDown = (event: MouseEvent<HTMLDivElement>) => {
+    if (!isPlacingMark) return;
+
+    const target = event.target as HTMLElement;
+    if (target.closest('[data-hotspot-button="true"]')) return;
+
+    const point = getNormalizedPoint(event);
+    if (!point) return;
+
+    event.preventDefault();
+    setShowHotspotOverlay(true);
+    setIsDrawingMark(true);
+
+    const label = `New ${isPlacingMark.charAt(0).toUpperCase() + isPlacingMark.slice(1)}`;
+    const id = `${isPlacingMark}-${Date.now()}`;
+    drawStartRef.current = { ...point, id, label };
+    setDraftMark({
+        id,
+        x: point.x,
+        y: point.y,
+        width: 0,
+        height: 0,
+        label,
+        type: isPlacingMark,
+        isNew: true,
+    });
+  };
+
+  const handleCanvasMouseMove = (event: MouseEvent<HTMLDivElement>) => {
+    if (!isDrawingMark || !drawStartRef.current) return;
+    const current = getNormalizedPoint(event);
+    if (!current) return;
+    const start = drawStartRef.current;
+    const minX = Math.min(start.x, current.x);
+    const minY = Math.min(start.y, current.y);
+    const width = Math.abs(current.x - start.x);
+    const height = Math.abs(current.y - start.y);
+    const centerX = minX + width / 2;
+    const centerY = minY + height / 2;
+
+    setDraftMark(prev => prev ? ({
+        ...prev,
+        x: centerX,
+        y: centerY,
+        width,
+        height,
+    }) : prev);
+  };
+
+  const handleCanvasMouseUp = () => {
+    if (!isDrawingMark || !drawStartRef.current || !draftMark) {
+        cancelDraftMark();
+        return;
+    }
+
+    const width = draftMark.width ?? 0;
+    const height = draftMark.height ?? 0;
+    const minSize = 0.01;
+    if (width < minSize || height < minSize) {
+        cancelDraftMark();
+        return;
+    }
+
     const newMark: Mark = {
-      id: newMarkId,
-      x, y,
-      scale: isPlacingMark === 'image' ? 0.2 : undefined,
-      label: `New ${isPlacingMark.charAt(0).toUpperCase() + isPlacingMark.slice(1)}`,
-      type: isPlacingMark,
-      isNew: true,
+        ...draftMark,
+        scale: Math.max(width, height),
     };
 
     setMarks(prev => [...prev, newMark]);
-    setEnabledMarks(prev => ({ ...prev, [newMarkId]: true }));
+    setEnabledMarks(prev => ({ ...prev, [newMark.id]: false }));
     if (newMark.type === 'text') {
-      setTextFields(prev => ({ ...prev, [newMarkId]: 'Your new text here' }));
-      setImageModes(prev => ({ ...prev }));
-      setImagePrompts(prev => ({ ...prev }));
+        setTextFields(prev => ({ ...prev, [newMark.id]: 'Your new text here' }));
     }
     if (newMark.type === 'image') {
-      setImageModes(prev => ({ ...prev, [newMarkId]: 'upload' }));
-      setImagePrompts(prev => ({ ...prev, [newMarkId]: '' }));
+        setImageModes(prev => ({ ...prev, [newMark.id]: 'upload' }));
+        setImagePrompts(prev => ({ ...prev, [newMark.id]: '' }));
     }
+
+    lastFocusedHotspotIdRef.current = newMark.id;
+    setActiveHotspotId(newMark.id);
+
+    cancelDraftMark();
     setIsPlacingMark(null);
   };
 
@@ -591,6 +733,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setImageAssets(prev => { const next = {...prev}; delete next[markId]; return next; });
     setImageModes(prev => { const next = {...prev}; delete next[markId]; return next; });
     setImagePrompts(prev => { const next = {...prev}; delete next[markId]; return next; });
+    delete canvasHotspotRefs.current[markId];
     if (activeHotspotId === markId) {
       setActiveHotspotId(null);
     }
@@ -602,10 +745,11 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     downloadImage(activeImage.imageUrl, `creative-${activeImage.id}.png`, watermark);
   };
   
-  const renderInitialEditForm = () => {
-    const hasMarks = marks.length > 0;
-    const includedMarks = marks.filter(mark => enabledMarks[mark.id]);
-    const readyMarks = includedMarks.filter(mark => {
+  const includedMarks = useMemo(() => marks.filter(mark => enabledMarks[mark.id]), [marks, enabledMarks]);
+  const ignoredMarks = useMemo(() => marks.filter(mark => !enabledMarks[mark.id]), [marks, enabledMarks]);
+
+  const readyIncludedMarks = useMemo(() => {
+    return includedMarks.filter(mark => {
         if (mark.type === 'text') {
             const text = textFields[mark.id];
             return !!(text && text.trim().length > 0);
@@ -621,173 +765,111 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         }
         return false;
     });
-    const missingMarks = includedMarks.length - readyMarks.length;
+  }, [includedMarks, textFields, imageAssets, imagePrompts, imageModes]);
 
-    const renderMarkCard = (mark: Mark) => {
-        const isEnabled = !!enabledMarks[mark.id];
-        const toggleMark = () => setEnabledMarks(prev => ({ ...prev, [mark.id]: !isEnabled }));
-        const hasValue = mark.type === 'text'
-            ? !!(textFields[mark.id] && textFields[mark.id].trim().length > 0)
-            : !!imageAssets[mark.id] || !!(imagePrompts[mark.id] && imagePrompts[mark.id].trim().length > 0);
-        const statusCopy = !isEnabled
-            ? 'Ignored for the next render.'
-            : mark.type === 'text'
-                ? (hasValue ? 'Custom copy ready.' : 'Using template copy.')
-                : (hasValue ? (imageAssets[mark.id] ? 'Upload ready.' : 'Description ready.') : 'Needs an upload or description.');
-        const modeLabel = mark.type === 'image' ? (imageModes[mark.id] === 'describe' ? 'Describe' : 'Upload') : null;
+  const missingIncludedMarks = useMemo(() => {
+    const readyIds = new Set(readyIncludedMarks.map(mark => mark.id));
+    return includedMarks.filter(mark => !readyIds.has(mark.id));
+  }, [includedMarks, readyIncludedMarks]);
 
-        return (
-            <div
-                key={mark.id}
-                ref={el => {
-                    if (el) {
-                        formFieldsRef.current[mark.id] = el;
-                    } else {
-                        delete formFieldsRef.current[mark.id];
-                    }
-                }}
-                onMouseEnter={() => setHoveredMarkId(mark.id)}
-                onMouseLeave={() => setHoveredMarkId(null)}
-                className={`rounded-2xl border transition-all bg-white/95 backdrop-blur-sm shadow-sm p-4 flex flex-col gap-3 ${hoveredMarkId === mark.id ? 'border-emerald-500 shadow-emerald-100' : 'border-slate-200'}`}
+  const missingIncludedMarksCount = Math.max(0, includedMarks.length - readyIncludedMarks.length);
+
+  const renderGlobalControls = () => (
+    <div className="grid w-full grid-cols-1 gap-4 sm:grid-cols-2">
+      <div className="relative rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+        <p className="font-medium text-gray-800">Aspect ratio</p>
+        <p className="mt-1 text-xs text-gray-500">Pick the format for your next render.</p>
+        <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+          {['original', '1:1', '16:9', '9:16'].map(option => (
+            <button
+              key={option}
+              type="button"
+              onClick={() => setAspectRatio(option)}
+              className={`rounded-lg border px-3 py-2 text-sm font-semibold capitalize transition-colors ${
+                aspectRatio === option ? 'border-emerald-500 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-white text-gray-600 hover:bg-slate-50'
+              }`}
             >
-                <div className="flex items-start justify-between gap-3">
-                    <div className="space-y-1">
-                        <div className="flex items-center gap-2 flex-wrap">
-                            <p className="font-semibold text-gray-900">{mark.label}</p>
-                            <span className="text-[11px] uppercase tracking-wide bg-slate-100 text-gray-600 px-2 py-0.5 rounded-full">{mark.type}</span>
-                            {modeLabel && <span className="text-[11px] uppercase tracking-wide bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full">{modeLabel}</span>}
-                            {mark.isNew && <span className="text-[11px] uppercase tracking-wide bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">New</span>}
-                        </div>
-                        <p className="text-xs text-gray-500 leading-relaxed">{statusCopy}</p>
-                    </div>
-                    <div className="flex items-center gap-2">
-                        {mark.isNew && (
-                            <button type="button" onClick={() => removeMark(mark.id)} className="text-gray-400 hover:text-red-500" title="Remove hotspot">
-                                <TrashIcon className="w-4 h-4" />
-                            </button>
-                        )}
-                        <button
-                            type="button"
-                            onClick={toggleMark}
-                            aria-pressed={isEnabled}
-                            className={`px-3 py-1 rounded-full text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-400 ${isEnabled ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-gray-600'}`}
-                        >
-                            {isEnabled ? 'Include' : 'Ignore'}
-                        </button>
-                    </div>
-                </div>
-                <div className="flex items-center gap-2 justify-end">
-                    <button
-                        type="button"
-                        onClick={() => setActiveHotspotId(mark.id)}
-                        className="px-3 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 rounded-lg hover:bg-emerald-100"
-                    >
-                        Open editor
-                    </button>
-                </div>
-            </div>
-        );
+              {option === 'original' ? 'Original' : option.replace(':', ':')}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+        <div className="flex items-center justify-between">
+          <p className="font-medium text-gray-800">Brand palette</p>
+          <button
+            type="button"
+            onClick={() => setIsSettingsOpen(true)}
+            className="text-xs font-semibold text-emerald-600 hover:text-emerald-700"
+          >
+            Adjust
+          </button>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          {brandColors.length > 0 ? (
+            brandColors.map(color => (
+              <span
+                key={color}
+                className="h-7 w-7 rounded-full border border-white shadow-sm"
+                style={{ backgroundColor: color }}
+                title={color}
+              />
+            ))
+          ) : (
+            <p className="text-xs text-gray-500 leading-relaxed">Stick with the template colors or tap Adjust to choose your brand palette.</p>
+          )}
+        </div>
+        {isSettingsOpen && (
+          <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4 shadow-lg">
+            <ColorPaletteSelector
+              selectedPalette={brandColors}
+              onPaletteChange={palette => {
+                setBrandColors(palette);
+                setIsSettingsOpen(false);
+              }}
+              userBrandColors={appUser?.brandColors}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  const renderFloatingActions = () => {
+    const disabled = isGenerating || isDemoMode || includedMarks.length === 0;
+    const handleChatClick = () => {
+      if (!isProUser || !appUser) return;
+      setIsChatDrawerOpen(true);
+      drawerIncludeButtonRef.current?.focus();
     };
 
     return (
-        <div className="space-y-6 pb-6">
-            <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div>
-                        <p className="text-sm font-semibold text-gray-800">Hotspot summary</p>
-                        <p className="text-xs text-gray-500">{includedMarks.length} included · {marks.length - includedMarks.length} ignored</p>
-                    </div>
-                    <div className="flex items-center gap-3 text-xs">
-                        <span className="flex items-center gap-1 text-emerald-600 font-semibold">
-                            <span className="inline-block h-2 w-2 rounded-full bg-emerald-500"></span>
-                            {readyMarks.length} ready
-                        </span>
-                        <span className="flex items-center gap-1 text-amber-600 font-semibold">
-                            <span className="inline-block h-2 w-2 rounded-full bg-amber-400"></span>
-                            {missingMarks} need input
-                        </span>
-                    </div>
-                </div>
-                <p className="mt-3 text-sm text-gray-600">Click a hotspot to update it. Only “Included” hotspots contribute to the next render.</p>
-            </div>
-
-            <div className="flex items-start gap-3 rounded-2xl border border-emerald-100 bg-emerald-50/80 p-4">
-                <div className="mt-0.5 rounded-full bg-white/70 p-2 shadow-sm">
-                    <SparklesIcon className="w-4 h-4 text-emerald-600" />
-                </div>
-                <div>
-                    <p className="font-semibold text-emerald-800">Quick start</p>
-                    <p className="text-sm text-emerald-700 leading-relaxed">Tap a hotspot on the canvas (or in this list) to enter the exact text or upload the image you want. Everything you mark as “Include” feeds the next render.</p>
-                </div>
-            </div>
-
-            <div className="space-y-3">
-                {hasMarks ? marks.map(renderMarkCard) : (
-                    <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-6 text-center text-sm text-gray-500">
-                        <p>No editable regions yet. Use the “Add text hotspot” or “Add image hotspot” buttons beside the preview to mark a spot.</p>
-                    </div>
-                )}
-            </div>
-
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                    <p className="font-medium text-gray-800">Aspect ratio</p>
-                    <p className="text-xs text-gray-500 mt-1">Pick the format for your next render.</p>
-                    <select
-                        id="aspect-ratio-select"
-                        value={aspectRatio}
-                        onChange={e => setAspectRatio(e.target.value)}
-                        className="mt-3 block w-full pl-3 pr-10 py-2 text-sm border-slate-300 rounded-md focus:outline-none focus:ring-emerald-500 focus:border-emerald-500"
-                    >
-                        <option value="original">Original</option>
-                        <option value="1:1">1:1 (Square)</option>
-                        <option value="16:9">16:9 (Widescreen)</option>
-                        <option value="9:16">9:16 (Story)</option>
-                    </select>
-                </div>
-                <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm flex flex-col gap-3">
-                    <div className="flex items-center justify-between">
-                        <p className="font-medium text-gray-800">Brand palette</p>
-                        <button type="button" onClick={() => setIsSettingsOpen(true)} className="text-xs font-semibold text-emerald-600 hover:text-emerald-700">
-                            Adjust
-                        </button>
-                    </div>
-                    {brandColors.length > 0 ? (
-                        <div className="flex items-center gap-2">
-                            {brandColors.map(color => (
-                                <span key={color} className="h-6 w-6 rounded-full border border-white shadow-sm" style={{ backgroundColor: color }} title={color} />
-                            ))}
-                        </div>
-                    ) : (
-                        <p className="text-xs text-gray-500 leading-relaxed">Stick with the template colors or pop open the gear icon above to choose your brand palette.</p>
-                    )}
-                </div>
-            </div>
-
-            <div className="rounded-2xl bg-slate-900 text-white shadow-sm p-5 space-y-4">
-                <div className="flex items-start gap-3">
-                    <div className="mt-1">
-                        <SparklesIcon className="w-5 h-5 text-amber-300" />
-                    </div>
-                    <div>
-                        <p className="font-semibold tracking-tight">Generate with AI</p>
-                        <p className="text-sm text-slate-200/90 mt-1 leading-relaxed">We’ll blend the enabled fields, uploads, and palette into your next version.</p>
-                    </div>
-                </div>
-                <button
-                    onClick={handleGenerateFromForm}
-                    disabled={isGenerating || isDemoMode}
-                    className="w-full flex justify-center items-center gap-2 py-3 px-4 rounded-lg text-sm font-semibold text-slate-900 bg-emerald-400 hover:bg-emerald-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-300 disabled:bg-emerald-400/60 disabled:text-slate-600 transition-colors"
-                >
-                    {isGenerating ? 'Generating…' : <><SparklesIcon className="w-5 h-5" />Generate creative</>}
-                </button>
-                {isDemoMode && <p className="text-xs text-center text-slate-200/80">Generation is disabled. Set API_KEY to enable.</p>}
-            </div>
+      <div className="fixed inset-x-0 bottom-6 z-40 flex justify-center px-4">
+        <div className="flex w-full max-w-2xl items-center gap-3 rounded-full bg-white/95 px-4 py-3 shadow-xl backdrop-blur-sm sm:px-6">
+          {isProUser && appUser && (
+            <button
+              type="button"
+              onClick={handleChatClick}
+              className="flex flex-1 items-center justify-center gap-2 rounded-full border border-emerald-200 bg-white px-4 py-2 text-sm font-semibold text-emerald-700 shadow-sm hover:bg-white/90"
+            >
+              <SparklesIcon className="h-4 w-4" /> Mention '@' to edit via chat
+            </button>
+          )}
+          <button
+            onClick={handleGenerateClick}
+            disabled={disabled}
+            className={`flex flex-1 items-center justify-center gap-2 rounded-full px-5 py-3 text-sm font-semibold shadow-lg transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-300 focus:ring-offset-2 ${
+              disabled ? 'bg-emerald-500/60 text-white/80 cursor-not-allowed' : 'bg-emerald-500 text-white hover:bg-emerald-400'
+            }`}
+          >
+            {isGenerating ? 'Generating…' : (<><SparklesIcon className="h-5 w-5" />Generate creative</>)}
+          </button>
         </div>
+      </div>
     );
   };
 
-  const renderHotspotModal = () => {
+  const renderHotspotDrawer = () => {
     if (!activeMark) return null;
 
     const markId = activeMark.id;
@@ -813,6 +895,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
             });
             setImagePrompts(prev => ({ ...prev, [markId]: '' }));
         }
+        setEnabledMarks(prev => ({ ...prev, [markId]: false }));
     };
 
     const handleModeChange = (nextMode: 'upload' | 'describe') => {
@@ -823,12 +906,16 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                 delete next[markId];
                 return next;
             });
+            setEnabledMarks(prev => ({ ...prev, [markId]: false }));
+        } else {
+            drawerTextAreaRef.current = null;
         }
     };
 
     const handleAssetUpload = (asset: BrandAsset) => {
         setImageAssets(prev => ({ ...prev, [markId]: asset }));
         setImageModes(prev => ({ ...prev, [markId]: 'upload' }));
+        setEnabledMarks(prev => ({ ...prev, [markId]: true }));
     };
 
     const handleAssetClear = () => {
@@ -837,110 +924,206 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
             delete next[markId];
             return next;
         });
+        setEnabledMarks(prev => ({ ...prev, [markId]: false }));
     };
 
     return (
-        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center px-4 py-6">
-            <div className="absolute inset-0 bg-black/40" onClick={handleClose} aria-hidden="true"></div>
-            <div className="relative w-full max-w-lg sm:rounded-3xl rounded-t-3xl bg-white shadow-2xl p-6 space-y-6 max-h-[90vh] overflow-y-auto">
-                <div className="flex items-start justify-between gap-4">
+        <div className="fixed inset-0 z-50">
+            <div className="absolute inset-0 bg-black/30" onClick={handleClose} aria-hidden="true"></div>
+            <aside className="absolute inset-y-0 right-0 flex h-full w-full max-w-md flex-col bg-white shadow-2xl">
+                <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-5 py-4">
                     <div className="space-y-1">
                         <p className="text-xs font-semibold uppercase tracking-wide text-emerald-600">{isText ? 'Text hotspot' : 'Image hotspot'}</p>
                         <h3 className="text-2xl font-bold text-gray-900 font-display">{activeMark.label}</h3>
                     </div>
-                    <button onClick={handleClose} className="p-2 rounded-full hover:bg-slate-100 text-gray-500" aria-label="Close hotspot editor">
-                        <XIcon className="w-5 h-5" />
+                    <button onClick={handleClose} className="rounded-full p-2 text-gray-500 hover:bg-slate-100" aria-label="Close hotspot drawer">
+                        <XIcon className="h-5 w-5" />
                     </button>
                 </div>
 
-                <div className="flex items-center justify-between bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
-                    <div>
-                        <p className="text-xs font-semibold text-gray-600 uppercase">Include in next render</p>
-                        <p className="text-xs text-gray-500">{isEnabled ? 'This hotspot will be considered when you generate.' : 'Temporarily ignore this hotspot.'}</p>
+                <div className="flex-1 space-y-6 overflow-y-auto px-5 py-6">
+                    <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+                        <div>
+                            <p className="text-xs font-semibold uppercase text-gray-600">Include in next render</p>
+                            <p className="text-xs text-gray-500">{isEnabled ? 'This hotspot will be considered when you generate.' : 'Temporarily ignore this hotspot.'}</p>
+                        </div>
+                        <button
+                            type="button"
+                            ref={drawerIncludeButtonRef}
+                            onClick={toggleInclude}
+                            aria-pressed={isEnabled}
+                            className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 ${isEnabled ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-gray-600'}`}
+                        >
+                            {isEnabled ? 'Included' : 'Ignored'}
+                        </button>
                     </div>
+
+                    {isText && (
+                        <div className="space-y-3">
+                            <label className="text-sm font-semibold text-gray-800" htmlFor={`hotspot-text-${markId}`}>Replacement copy</label>
+                            <textarea
+                                id={`hotspot-text-${markId}`}
+                                ref={drawerTextAreaRef}
+                                value={textFields[markId] || ''}
+                                onChange={e => {
+                                    const nextValue = e.target.value;
+                                    const trimmed = nextValue.trim();
+                                    const originalTrimmed = (originalText || '').trim();
+                                    setTextFields(prev => ({ ...prev, [markId]: nextValue }));
+                                    setEnabledMarks(prev => ({
+                                        ...prev,
+                                        [markId]: trimmed.length > 0 ? (trimmed !== originalTrimmed || prev[markId]) : false
+                                    }));
+                                }}
+                                rows={activeMark.label.toLowerCase().includes('body') ? 4 : 2}
+                                placeholder="Enter the text you want to appear in this spot"
+                                className="w-full rounded-xl border border-slate-300 py-3 px-4 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                            />
+                            {originalText && (
+                                <p className="text-xs text-gray-500">Template copy: “{originalText}”</p>
+                            )}
+                            <div className="flex items-center justify-between">
+                                <button type="button" onClick={handleReset} className="text-xs font-semibold text-gray-500 hover:text-gray-700">
+                                    Reset to template copy
+                                </button>
+                                <button type="button" onClick={handleClose} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500">
+                                    Done
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {isImage && (
+                        <div className="space-y-4">
+                            <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-2">
+                                <button
+                                    type="button"
+                                    onClick={() => handleModeChange('upload')}
+                                    className={`rounded-lg px-3 py-2 text-sm font-semibold ${mode === 'upload' ? 'bg-white text-emerald-700 shadow' : 'text-gray-600 hover:bg-white/80'}`}
+                                >
+                                    Upload image
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => handleModeChange('describe')}
+                                    className={`rounded-lg px-3 py-2 text-sm font-semibold ${mode === 'describe' ? 'bg-white text-emerald-700 shadow' : 'text-gray-600 hover:bg-white/80'}`}
+                                >
+                                    Describe image
+                                </button>
+                            </div>
+
+                            {mode === 'upload' ? (
+                                <FileUploader
+                                    title={activeMark.label}
+                                    onFileUpload={handleAssetUpload}
+                                    asset={currentAsset}
+                                    onClear={handleAssetClear}
+                                />
+                            ) : (
+                                <div className="space-y-2">
+                                    <textarea
+                                        ref={drawerTextAreaRef as MutableRefObject<HTMLTextAreaElement | null>}
+                                        value={currentPrompt}
+                                        onChange={e => {
+                                            const nextValue = e.target.value;
+                                            setImagePrompts(prev => ({ ...prev, [markId]: nextValue }));
+                                            const trimmed = nextValue.trim();
+                                            setEnabledMarks(prev => ({
+                                                ...prev,
+                                                [markId]: trimmed.length > 0 ? true : prev[markId]
+                                            }));
+                                        }}
+                                        rows={4}
+                                        placeholder="Describe the image you want here (colors, subject, style, lighting, etc.)"
+                                        className="w-full rounded-xl border border-slate-300 py-3 px-4 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                                    />
+                                    <p className="text-xs text-gray-500">We’ll generate (or swap in) an image that matches this description.</p>
+                                </div>
+                            )}
+
+                            <div className="flex items-center justify-between">
+                                <button type="button" onClick={handleReset} className="text-xs font-semibold text-gray-500 hover:text-gray-700">
+                                    Reset to template artwork
+                                </button>
+                                <button type="button" onClick={handleClose} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500">
+                                    Done
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            </aside>
+        </div>
+    );
+  };
+
+  const renderGenerationConfirm = () => {
+    if (!isGenerationConfirmOpen || pendingExcludedMarks.length === 0) return null;
+
+    const handleClose = () => {
+        setIsGenerationConfirmOpen(false);
+        setPendingExcludedMarks([]);
+    };
+
+    const handleIncludeAll = () => {
+        setEnabledMarks(prev => {
+            const next = { ...prev };
+            pendingExcludedMarks.forEach(mark => {
+                next[mark.id] = true;
+            });
+            return next;
+        });
+        setPendingExcludedMarks([]);
+        setIsGenerationConfirmOpen(false);
+    };
+
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center px-4 py-6">
+            <div className="absolute inset-0 bg-black/40" onClick={handleClose} aria-hidden="true"></div>
+            <div className="relative w-full max-w-lg rounded-2xl bg-white p-6 shadow-2xl space-y-5">
+                <div className="flex items-start gap-3">
+                    <div className="rounded-full bg-amber-100 p-2 text-amber-600">
+                        <SparklesIcon className="w-5 h-5" />
+                    </div>
+                    <div>
+                        <h3 className="text-lg font-semibold text-gray-900">Generate without every hotspot?</h3>
+                        <p className="mt-1 text-sm text-gray-600">You still have {pendingExcludedMarks.length} hotspot{pendingExcludedMarks.length > 1 ? 's' : ''} set to ignore. Include them now or continue with your current selection.</p>
+                    </div>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+                    <p className="text-xs font-semibold text-gray-600 uppercase tracking-wide">Ignored hotspots</p>
+                    <ul className="mt-2 space-y-1 text-sm text-gray-700">
+                        {pendingExcludedMarks.map(mark => (
+                            <li key={mark.id} className="flex gap-2">
+                                <span className="text-gray-400">-</span>
+                                <span>{mark.label}</span>
+                            </li>
+                        ))}
+                    </ul>
+                </div>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-end sm:gap-3">
                     <button
                         type="button"
-                        onClick={toggleInclude}
-                        aria-pressed={isEnabled}
-                        className={`px-3 py-1 rounded-full text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-400 ${isEnabled ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-gray-600'}`}
+                        onClick={handleClose}
+                        className="w-full sm:w-auto rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-gray-700 hover:bg-slate-100"
                     >
-                        {isEnabled ? 'Included' : 'Ignored'}
+                        Review hotspots
+                    </button>
+                    <button
+                        type="button"
+                        onClick={executeGeneration}
+                        className="w-full sm:w-auto rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-400"
+                    >
+                        Generate anyway
                     </button>
                 </div>
-
-                {isText && (
-                    <div className="space-y-3">
-                        <label className="text-sm font-semibold text-gray-800">Replacement copy</label>
-                        <textarea
-                            value={textFields[markId] || ''}
-                            onChange={e => setTextFields(prev => ({ ...prev, [markId]: e.target.value }))}
-                            rows={activeMark.label.toLowerCase().includes('body') ? 4 : 2}
-                            placeholder="Enter the text you want to appear in this spot"
-                            className="w-full border border-slate-300 rounded-xl py-3 px-4 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
-                        />
-                        {originalText && (
-                            <p className="text-xs text-gray-500">Template copy: “{originalText}”</p>
-                        )}
-                        <div className="flex justify-between items-center">
-                            <button type="button" onClick={handleReset} className="text-xs font-semibold text-gray-500 hover:text-gray-700">
-                                Reset to template copy
-                            </button>
-                            <button type="button" onClick={handleClose} className="px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm font-semibold hover:bg-emerald-500">
-                                Done
-                            </button>
-                        </div>
-                    </div>
-                )}
-
-                {isImage && (
-                    <div className="space-y-4">
-                        <div className="grid grid-cols-2 gap-2 bg-slate-50 border border-slate-200 rounded-xl p-2">
-                            <button
-                                type="button"
-                                onClick={() => handleModeChange('upload')}
-                                className={`px-3 py-2 rounded-lg text-sm font-semibold ${mode === 'upload' ? 'bg-white shadow text-emerald-700' : 'text-gray-600 hover:bg-white/80'}`}
-                            >
-                                Upload image
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => handleModeChange('describe')}
-                                className={`px-3 py-2 rounded-lg text-sm font-semibold ${mode === 'describe' ? 'bg-white shadow text-emerald-700' : 'text-gray-600 hover:bg-white/80'}`}
-                            >
-                                Describe image
-                            </button>
-                        </div>
-
-                        {mode === 'upload' ? (
-                            <FileUploader
-                                title={activeMark.label}
-                                onFileUpload={handleAssetUpload}
-                                asset={currentAsset}
-                                onClear={handleAssetClear}
-                            />
-                        ) : (
-                            <div className="space-y-2">
-                                <textarea
-                                    value={currentPrompt}
-                                    onChange={e => setImagePrompts(prev => ({ ...prev, [markId]: e.target.value }))}
-                                    rows={4}
-                                    placeholder="Describe the image you want here (colors, subject, style, lighting, etc.)"
-                                    className="w-full border border-slate-300 rounded-xl py-3 px-4 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
-                                />
-                                <p className="text-xs text-gray-500">We’ll generate (or swap in) an image that matches this description.</p>
-                            </div>
-                        )}
-
-                        <div className="flex justify-between items-center">
-                            <button type="button" onClick={handleReset} className="text-xs font-semibold text-gray-500 hover:text-gray-700">
-                                Reset to template artwork
-                            </button>
-                            <button type="button" onClick={handleClose} className="px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm font-semibold hover:bg-emerald-500">
-                                Done
-                            </button>
-                        </div>
-                    </div>
-                )}
+                <button
+                    type="button"
+                    onClick={handleIncludeAll}
+                    className="w-full text-xs font-semibold text-emerald-600 hover:text-emerald-700"
+                >
+                    Include all hotspots instead
+                </button>
             </div>
         </div>
     );
@@ -951,14 +1134,14 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
     if (!isProUser) {
         return (
-            <div className="fixed bottom-4 right-4 z-40">
-                <div className="bg-white/95 backdrop-blur border border-slate-200 rounded-2xl shadow-lg px-4 py-3 flex items-center gap-3">
-                    <SparklesIcon className="w-5 h-5 text-emerald-500" />
-                    <div>
+            <div className="fixed inset-x-0 bottom-24 z-30 flex justify-center px-4">
+                <div className="flex w-full max-w-xl items-center gap-3 rounded-full bg-white/95 px-4 py-3 shadow-xl backdrop-blur-sm">
+                    <SparklesIcon className="h-5 w-5 text-emerald-500" />
+                    <div className="flex-1">
                         <p className="text-sm font-semibold text-gray-800">Upgrade to unlock chat edits</p>
                         <p className="text-xs text-gray-500">Pro lets you tweak designs with quick @hotspot prompts.</p>
                     </div>
-                    <button onClick={onUpgrade} className="px-3 py-1.5 text-xs font-semibold text-white bg-emerald-500 rounded-full hover:bg-emerald-600">
+                    <button onClick={onUpgrade} className="rounded-full bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-600">
                         Upgrade
                     </button>
                 </div>
@@ -966,92 +1149,88 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         );
     }
 
+    if (!isChatDrawerOpen) return null;
+
     return (
-        <div className="fixed bottom-4 right-4 z-40 flex flex-col items-end gap-3">
-            {isChatDrawerOpen ? (
-                <div className="w-[min(360px,calc(100vw-2rem))] bg-white/98 backdrop-blur border border-slate-200 rounded-3xl shadow-2xl flex flex-col max-h-[70vh]">
-                    <div className="flex items-start justify-between gap-3 p-4 border-b border-slate-200">
-                        <div>
-                            <p className="text-sm font-semibold text-emerald-700">Chat edits</p>
-                            <p className="text-xs text-gray-500">Mention hotspots like <span className="font-mono text-emerald-600">@Headline</span> for targeted tweaks.</p>
-                        </div>
-                        <button onClick={() => setIsChatDrawerOpen(false)} className="p-1.5 rounded-full hover:bg-slate-100 text-gray-500" aria-label="Close chat drawer">
-                            <XIcon className="w-4 h-4" />
-                        </button>
+        <div className="fixed inset-0 z-50 flex items-end justify-center px-4 pb-32">
+            <div className="absolute inset-0 bg-black/30" onClick={() => setIsChatDrawerOpen(false)} aria-hidden="true"></div>
+            <div className="relative w-full max-w-2xl rounded-3xl bg-white shadow-2xl backdrop-blur-sm">
+                <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-5 py-4">
+                    <div>
+                        <p className="text-sm font-semibold text-emerald-700">Chat edits</p>
+                        <p className="text-xs text-gray-500">Mention hotspots like <span className="font-mono text-emerald-600">@Headline</span> for targeted tweaks.</p>
                     </div>
-                    <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
-                        {chatMessages.map(msg => (
-                            <div key={msg.id} className={`flex gap-3 ${msg.role === 'user' ? 'justify-end' : ''}`}>
-                                {msg.role === 'assistant' && <div className="w-7 h-7 rounded-full bg-emerald-100 flex items-center justify-center shrink-0"><SparklesIcon className="w-4 h-4 text-emerald-500"/></div>}
-                                <div className={`p-3 rounded-2xl max-w-[260px] break-words text-sm ${msg.role === 'user' ? 'bg-emerald-500 text-white rounded-br-xl' : msg.type === 'error' ? 'bg-red-100 text-red-800 rounded-bl-xl' : 'bg-slate-100 text-gray-800 rounded-bl-xl'}`}>
-                                    {msg.text && <p>{msg.text}</p>}
-                                    {msg.referenceImagePreviewUrl && <img src={msg.referenceImagePreviewUrl} alt="Reference" className="mt-2 rounded-lg max-h-32" />}
-                                    {msg.generatedImageUrl && <img src={msg.generatedImageUrl} alt="Generated" className="mt-2 rounded-lg" />}
-                                </div>
+                    <button onClick={() => setIsChatDrawerOpen(false)} className="rounded-full p-2 text-gray-500 hover:bg-slate-100" aria-label="Close chat edits">
+                        <XIcon className="h-4 w-4" />
+                    </button>
+                </div>
+                <div className="max-h-[50vh] overflow-y-auto px-5 py-4 space-y-3">
+                    {chatMessages.map(msg => (
+                        <div key={msg.id} className={`flex gap-3 ${msg.role === 'user' ? 'justify-end' : ''}`}>
+                            {msg.role === 'assistant' && <div className="flex h-7 w-7 items-center justify-center rounded-full bg-emerald-100"><SparklesIcon className="h-4 w-4 text-emerald-500" /></div>}
+                            <div className={`max-w-[60%] rounded-2xl px-3 py-2 text-sm ${msg.role === 'user' ? 'bg-emerald-500 text-white rounded-br-xl' : msg.type === 'error' ? 'bg-red-100 text-red-800 rounded-bl-xl' : 'bg-slate-100 text-gray-800 rounded-bl-xl'}`}>
+                                {msg.text && <p>{msg.text}</p>}
+                                {msg.referenceImagePreviewUrl && <img src={msg.referenceImagePreviewUrl} alt="Reference" className="mt-2 rounded-lg" />}
+                                {msg.generatedImageUrl && <img src={msg.generatedImageUrl} alt="Generated" className="mt-2 rounded-lg" />}
                             </div>
-                        ))}
-                        {isGenerating && (
-                            <div className="flex gap-3 text-sm text-gray-500">
-                                <div className="w-7 h-7 rounded-full bg-emerald-100 flex items-center justify-center shrink-0"><SparklesIcon className="w-4 h-4 text-emerald-500 animate-spin"/></div>
-                                <div className="flex items-center gap-1">
-                                    <span className="w-2 h-2 bg-gray-400 rounded-full animate-pulse" style={{ animationDelay: '0s' }}></span>
-                                    <span className="w-2 h-2 bg-gray-400 rounded-full animate-pulse" style={{ animationDelay: '0.15s' }}></span>
-                                    <span className="w-2 h-2 bg-gray-400 rounded-full animate-pulse" style={{ animationDelay: '0.3s' }}></span>
-                                </div>
+                        </div>
+                    ))}
+                    {isGenerating && (
+                        <div className="flex gap-3 text-sm text-gray-500">
+                            <div className="flex h-7 w-7 items-center justify-center rounded-full bg-emerald-100"><SparklesIcon className="h-4 w-4 text-emerald-500 animate-spin" /></div>
+                            <div className="flex items-center gap-1">
+                                <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" style={{ animationDelay: '0s' }}></span>
+                                <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" style={{ animationDelay: '0.15s' }}></span>
+                                <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" style={{ animationDelay: '0.3s' }}></span>
+                            </div>
+                        </div>
+                    )}
+                    <div ref={messagesEndRef} />
+                </div>
+                <div className="border-t border-slate-200 px-5 py-4">
+                    <form onSubmit={handleChatEdit} className="space-y-2">
+                        {chatAttachment && (
+                            <div className="relative flex items-center gap-2 rounded-md bg-slate-100 p-2 text-xs">
+                                <img src={chatAttachment.previewUrl} alt="Attachment preview" className="h-8 w-8 rounded object-cover" />
+                                <p className="flex-1 truncate text-gray-600">{chatAttachment.file.name}</p>
+                                <button type="button" onClick={() => setChatAttachment(null)} className="rounded-full p-1 text-gray-500 hover:bg-slate-200" aria-label="Remove attachment">
+                                    <XIcon className="h-3.5 w-3.5" />
+                                </button>
                             </div>
                         )}
-                        <div ref={messagesEndRef} />
-                    </div>
-                        <div className="border-t border-slate-200 p-4">
-                            <form onSubmit={handleChatEdit} className="space-y-2">
-                                {chatAttachment && (
-                                    <div className="relative p-2 bg-slate-100 rounded-md flex items-center gap-2 text-xs">
-                                        <img src={chatAttachment.previewUrl} alt="Attachment preview" className="w-8 h-8 rounded object-cover" />
-                                    <p className="truncate flex-1 text-gray-600">{chatAttachment.file.name}</p>
-                                    <button type="button" onClick={() => setChatAttachment(null)} className="p-1 rounded-full hover:bg-slate-200 text-gray-500" aria-label="Remove attachment">
-                                        <XIcon className="w-3.5 h-3.5" />
-                                    </button>
-                                </div>
-                                )}
-                                <div className="relative">
-                                <textarea
-                                    ref={chatTextAreaRef}
-                                    value={chatPrompt}
-                                    onChange={(e) => handleChatPromptChange(e.target.value, e.target)}
-                                    onKeyDown={(e) => {
-                                        if (e.key === 'Escape' && mentionSuggestions.length > 0) {
-                                            e.preventDefault();
-                                            closeMentionSuggestions();
-                                            return;
-                                        }
-                                        if (e.key === 'Enter' && !e.shiftKey) {
-                                            e.preventDefault();
-                                            handleChatEdit(e);
-                                        }
-                                    }}
-                                        placeholder={isGenerating ? 'Processing…' : 'Describe your tweak. Try @Headline to target a region.'}
-                                        className="w-full border border-slate-300 rounded-xl py-3 pl-10 pr-12 resize-none focus:ring-emerald-500 focus:border-emerald-500"
-                                        rows={2}
-                                        disabled={isGenerating}
-                                        onBlur={() => closeMentionSuggestions()}
-                                    />
-                                <button type="button" onClick={() => fileInputRef.current?.click()} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-emerald-600 disabled:text-gray-300" disabled={isGenerating}>
-                                    <PaperclipIcon className="w-5 h-5" />
-                                </button>
-                                <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept="image/*" />
-                                <button type="submit" className="absolute right-3 top-1/2 -translate-y-1/2 text-emerald-600 hover:text-emerald-700 disabled:text-gray-400" disabled={!chatPrompt.trim() || isGenerating}>
-                                    <SendIcon className="w-5 h-5" />
-                                </button>
-                            </div>
-                        </form>
-                    </div>
+                        <div className="relative">
+                            <textarea
+                                ref={chatTextAreaRef}
+                                value={chatPrompt}
+                                onChange={e => handleChatPromptChange(e.target.value, e.target)}
+                                onKeyDown={e => {
+                                    if (e.key === 'Escape' && mentionSuggestions.length > 0) {
+                                        e.preventDefault();
+                                        closeMentionSuggestions();
+                                        return;
+                                    }
+                                    if (e.key === 'Enter' && !e.shiftKey) {
+                                        e.preventDefault();
+                                        handleChatEdit(e);
+                                    }
+                                }}
+                                placeholder={isGenerating ? 'Processing…' : 'Describe your tweak. Try @Headline to target a region.'}
+                                className="w-full rounded-xl border border-slate-300 py-3 pl-10 pr-12 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                                rows={2}
+                                disabled={isGenerating}
+                                onBlur={() => closeMentionSuggestions()}
+                            />
+                            <button type="button" onClick={() => fileInputRef.current?.click()} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-emerald-600 disabled:text-gray-300" disabled={isGenerating}>
+                                <PaperclipIcon className="h-5 w-5" />
+                            </button>
+                            <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept="image/*" />
+                            <button type="submit" className="absolute right-3 top-1/2 -translate-y-1/2 text-emerald-600 hover:text-emerald-700 disabled:text-gray-400" disabled={!chatPrompt.trim() || isGenerating}>
+                                <SendIcon className="h-5 w-5" />
+                            </button>
+                        </div>
+                    </form>
                 </div>
-            ) : (
-                <button onClick={() => setIsChatDrawerOpen(true)} className="px-4 py-2.5 rounded-full bg-emerald-500 text-white text-sm font-semibold shadow-lg hover:bg-emerald-400 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-400 flex items-center gap-2">
-                    <SparklesIcon className="w-4 h-4" />
-                    Open chat edits
-                </button>
-            )}
+            </div>
         </div>
     );
   };
@@ -1137,190 +1316,282 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
           Back to Dashboard
         </button>
 
-        <div className="grid grid-cols-1 gap-8 lg:gap-10 xl:grid-cols-[minmax(0,1fr)_minmax(380px,460px)] lg:grid-cols-[minmax(0,1fr)_minmax(360px,440px)] lg:h-[calc(100vh-140px)]">
-          
-          <div className="flex flex-col gap-6 min-h-0">
-            <div 
-                ref={imagePreviewRef}
-                onClick={handleImageClick}
-                className={`flex-grow bg-white border border-slate-200 rounded-2xl shadow-sm flex items-center justify-center p-4 sm:p-6 relative group ${isPlacingMark ? 'cursor-crosshair' : ''}`}
-            >
-                <img 
-                    src={activeImageUrl} 
-                    alt="Creative Preview" 
-                    className="max-w-full max-h-[70vh] w-auto h-auto object-contain rounded-lg shadow-md" 
+        <div className="mx-auto w-full max-w-6xl space-y-8 pb-24">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-3 group/editor" onDoubleClick={() => setIsEditingName(true)}>
+              <SparklesIcon className="w-6 h-6 text-emerald-600" />
+              {isEditingName ? (
+                <input
+                  ref={nameInputRef}
+                  type="text"
+                  value={projectName}
+                  onChange={e => setProjectName(e.target.value)}
+                  onBlur={handleProjectNameBlur}
+                  onKeyDown={e => e.key === 'Enter' && handleProjectNameBlur()}
+                  className="-ml-1 rounded-md bg-slate-100 px-1 text-xl font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                 />
-                 <div className="absolute top-4 right-4 bg-black/50 text-white text-xs px-2 py-1 rounded-full">{activeIndex === 0 ? 'Template' : `Version ${activeIndex}`}</div>
-                 {history.length > 1 && (
-                     <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity rounded-2xl flex items-center justify-center pointer-events-none">
-                        <button onClick={handleDownload} className="flex items-center gap-2 bg-white text-black px-4 py-2 rounded-full text-sm font-semibold pointer-events-auto">
-                            <DownloadIcon className="w-4 h-4" /> Download
-                        </button>
-                    </div>
-                 )}
-                 {activeIndex === 0 && marks.map(mark => {
+              ) : (
+                <h2 className="text-xl font-bold text-gray-800 font-display">{projectName}</h2>
+              )}
+              <button onClick={() => setIsEditingName(true)} className="opacity-0 transition-opacity group-hover/editor:opacity-100">
+                <EditIcon className="h-4 w-4 text-gray-400" />
+              </button>
+            </div>
+            <div className="text-xs text-gray-500">
+              {marks.length} hotspot{marks.length === 1 ? '' : 's'} detected · {includedMarks.length} included · {missingIncludedMarksCount} need input
+            </div>
+          </div>
+
+          <div className="grid gap-8 lg:grid-cols-[220px_minmax(0,1fr)_240px]">
+            <aside className="space-y-4">
+              <p className="text-sm font-semibold uppercase tracking-wide text-gray-600">Versions</p>
+              <VersionHistory history={history} activeIndex={activeIndex} onSelect={setActiveIndex} />
+            </aside>
+
+            <div
+              ref={imagePreviewRef}
+              onMouseDown={handleCanvasMouseDown}
+              onMouseMove={handleCanvasMouseMove}
+              onMouseUp={handleCanvasMouseUp}
+              onMouseLeave={() => {
+                if (isDrawingMark) {
+                  cancelDraftMark();
+                }
+              }}
+              className={`group relative overflow-hidden rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6 ${isPlacingMark ? 'cursor-crosshair' : ''}`}
+            >
+              <img
+                ref={imageElementRef}
+                src={activeImageUrl}
+                alt="Creative Preview"
+                className="mx-auto h-auto max-h-[70vh] w-full max-w-4xl object-contain"
+                onLoad={updateImageBounds}
+              />
+              <div className="absolute right-4 top-4 rounded-full bg-black/50 px-2 py-1 text-xs text-white">
+                {activeIndex === 0 ? 'Template' : `Version ${activeIndex}`}
+              </div>
+              {history.length > 1 && (
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-2xl bg-black/60 opacity-0 transition-opacity group-hover:opacity-100">
+                  <button
+                    onClick={handleDownload}
+                    className="pointer-events-auto flex items-center gap-2 rounded-full bg-white px-4 py-2 text-sm font-semibold text-black"
+                  >
+                    <DownloadIcon className="h-4 w-4" /> Download
+                  </button>
+                </div>
+              )}
+              {imageBounds.width > 0 && imageBounds.height > 0 && (
+                <div
+                  className="absolute pointer-events-none"
+                  style={{
+                    left: imageBounds.left,
+                    top: imageBounds.top,
+                    width: imageBounds.width,
+                    height: imageBounds.height,
+                  }}
+                >
+                  {(showHotspotOverlay || isPlacingMark) && marks.map(mark => {
                     const left = ((mark.x - (mark.width ?? 0) / 2)) * 100;
                     const top = ((mark.y - (mark.height ?? 0) / 2)) * 100;
                     const width = (mark.width ?? 0) * 100;
                     const height = (mark.height ?? 0) * 100;
                     return (
-                        <button 
+                      <button
+                        key={mark.id}
+                        data-hotspot-button="true"
+                        ref={el => {
+                          canvasHotspotRefs.current[mark.id] = el;
+                        }}
+                        type="button"
+                        onClick={() => {
+                          lastFocusedHotspotIdRef.current = mark.id;
+                          setActiveHotspotId(mark.id);
+                        }}
+                        onMouseEnter={() => setHoveredMarkId(mark.id)}
+                        onMouseLeave={() => setHoveredMarkId(null)}
+                        aria-label={`Edit hotspot ${mark.label}`}
+                        className={`absolute rounded-sm transition-all pointer-events-auto ${hoveredMarkId === mark.id ? 'bg-emerald-400/20 ring-2 ring-emerald-500/80' : 'bg-black/0 ring-1 ring-white/70'} focus:outline-none focus:ring-2 focus:ring-emerald-400/80`}
+                        style={{ left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%` }}
+                      >
+                        <span className="absolute -top-5 left-0 rounded-full bg-black/80 px-1.5 py-0.5 text-xs text-white backdrop-blur-sm shadow-md">
+                          {mark.label}
+                        </span>
+                        <span className={`absolute inset-0 pointer-events-none border-2 border-dashed mix-blend-difference ${hoveredMarkId === mark.id ? 'border-emerald-600/80' : 'border-white/80'}`} />
+                      </button>
+                    );
+                  })}
+                  {draftMark && (
+                    <div
+                      className="pointer-events-none absolute rounded-sm border-2 border-dashed border-emerald-400/80 bg-emerald-400/10"
+                      style={{
+                        left: `${((draftMark.x - (draftMark.width ?? 0) / 2)) * 100}%`,
+                        top: `${((draftMark.y - (draftMark.height ?? 0) / 2)) * 100}%`,
+                        width: `${(draftMark.width ?? 0) * 100}%`,
+                        height: `${(draftMark.height ?? 0) * 100}%`,
+                      }}
+                    />
+                  )}
+                </div>
+              )}
+              {isPlacingMark && (
+                <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/50 p-4 text-center text-white">
+                  Click and drag on the template to outline the new {isPlacingMark} hotspot.
+                </div>
+              )}
+            </div>
+
+            <aside className="flex flex-col gap-4">
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-sm font-semibold text-gray-800">Hotspot tools</p>
+                  <button
+                    type="button"
+                    onClick={() => setShowHotspotOverlay(prev => !prev)}
+                    className="text-xs font-semibold text-emerald-600 hover:text-emerald-700"
+                  >
+                    {showHotspotOverlay ? 'Hide overlays' : 'Show overlays'}
+                  </button>
+                </div>
+                <p className="mt-1 text-xs text-gray-500">Add new regions while viewing the base template. Toggle overlays to inspect hotspots on any version.</p>
+                <div className="mt-3 flex flex-col gap-2">
+                  <button
+                    onClick={() => setIsPlacingMark('text')}
+                    className={`w-full rounded-lg border px-3 py-2 text-sm font-semibold transition-colors ${
+                      isPlacingMark === 'text' ? 'border-emerald-500 bg-emerald-500 text-white shadow-sm' : 'border-slate-200 bg-white text-gray-700 hover:bg-slate-100'
+                    }`}
+                  >
+                    Add text hotspot
+                  </button>
+                  <button
+                    onClick={() => setIsPlacingMark('image')}
+                    className={`w-full rounded-lg border px-3 py-2 text-sm font-semibold transition-colors ${
+                      isPlacingMark === 'image' ? 'border-emerald-500 bg-emerald-500 text-white shadow-sm' : 'border-slate-200 bg-white text-gray-700 hover:bg-slate-100'
+                    }`}
+                  >
+                    Add image hotspot
+                  </button>
+                  {isPlacingMark && (
+                    <button onClick={() => setIsPlacingMark(null)} className="text-sm font-medium text-gray-500 hover:text-gray-700">
+                      Cancel placement
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                <p className="text-sm font-semibold text-gray-800">Hotspot status</p>
+                <div className="mt-3 space-y-4">
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wide text-gray-600">Needs input</p>
+                    {missingIncludedMarks.length > 0 ? (
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {missingIncludedMarks.map(mark => (
+                          <button
                             key={mark.id}
                             type="button"
-                            onClick={() => setActiveHotspotId(mark.id)}
-                            onMouseEnter={() => setHoveredMarkId(mark.id)}
-                            onMouseLeave={() => setHoveredMarkId(null)}
-                            aria-label={`Edit hotspot ${mark.label}`}
-                            className={`absolute rounded-sm transition-all ${hoveredMarkId === mark.id ? 'ring-2 ring-emerald-500/80 bg-emerald-400/20' : 'ring-1 ring-white/70 bg-black/0'} focus:outline-none focus:ring-2 focus:ring-emerald-400/80`} 
-                            style={{ left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%` }}
-                        >
-                           <span className="absolute -top-5 left-0 text-xs bg-black/80 text-white px-1.5 py-0.5 rounded-full backdrop-blur-sm shadow-md">{mark.label}</span>
-                           <span className={`absolute inset-0 pointer-events-none border-2 border-dashed mix-blend-difference ${hoveredMarkId === mark.id ? 'border-emerald-600/80' : 'border-white/80'}`} />
-                        </button>
-                    )
-                 })}
-                 {isPlacingMark && (
-                    <div className="absolute inset-0 bg-black/50 rounded-2xl flex items-center justify-center text-white font-semibold p-4 text-center">
-                        Click on the template to place the new {isPlacingMark}.
-                    </div>
-                 )}
-            </div>
-            {activeIndex === 0 && (
-                <div className="flex items-center justify-center gap-3">
-                    <button
-                        onClick={() => setIsPlacingMark('text')}
-                        className={`rounded-xl px-4 py-2 text-sm font-semibold transition-colors border ${isPlacingMark === 'text' ? 'bg-emerald-500 text-white border-emerald-500 shadow-sm' : 'bg-white border-slate-200 text-gray-700 hover:bg-slate-100'}`}
-                    >
-                        Add text hotspot
-                    </button>
-                    <button
-                        onClick={() => setIsPlacingMark('image')}
-                        className={`rounded-xl px-4 py-2 text-sm font-semibold transition-colors border ${isPlacingMark === 'image' ? 'bg-emerald-500 text-white border-emerald-500 shadow-sm' : 'bg-white border-slate-200 text-gray-700 hover:bg-slate-100'}`}
-                    >
-                        Add image hotspot
-                    </button>
-                    {isPlacingMark && (
-                        <button onClick={() => setIsPlacingMark(null)} className="text-sm font-medium text-gray-500 hover:text-gray-700">
-                            Cancel
-                        </button>
-                    )}
-                </div>
-            )}
-            {history.length > 1 && <VersionHistory history={history} activeIndex={activeIndex} onSelect={setActiveIndex} />}
-          </div>
-
-          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 flex flex-col overflow-hidden lg:h-full lg:max-h-[calc(100vh-140px)]">
-            <div className="flex items-center justify-between p-4 border-b border-slate-200">
-                <div className="flex items-center gap-3 group/editor" onDoubleClick={() => setIsEditingName(true)}>
-                    <SparklesIcon className="w-6 h-6 text-emerald-600" />
-                    {isEditingName ? (
-                        <input
-                            ref={nameInputRef}
-                            type="text"
-                            value={projectName}
-                            onChange={e => setProjectName(e.target.value)}
-                            onBlur={handleProjectNameBlur}
-                            onKeyDown={e => e.key === 'Enter' && handleProjectNameBlur()}
-                            className="text-xl font-bold text-gray-800 font-display bg-slate-100 rounded-md -ml-1 px-1"
-                        />
+                            onClick={() => {
+                              setShowHotspotOverlay(true);
+                              lastFocusedHotspotIdRef.current = mark.id;
+                              setActiveHotspotId(mark.id);
+                            }}
+                            className="rounded-full border border-amber-300 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700 hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-300"
+                          >
+                            {mark.label}
+                          </button>
+                        ))}
+                      </div>
                     ) : (
-                        <h2 className="text-xl font-bold text-gray-800 font-display">{projectName}</h2>
+                      <p className="mt-2 text-xs text-gray-500">All included hotspots are ready.</p>
                     )}
-                    <button onClick={() => setIsEditingName(true)} className="opacity-0 group-hover/editor:opacity-100 transition-opacity">
-                        <EditIcon className="w-4 h-4 text-gray-400" />
-                    </button>
+                  </div>
+                  {ignoredMarks.length > 0 && (
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-wide text-gray-600">Ignored</p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {ignoredMarks.map(mark => (
+                          <button
+                            key={mark.id}
+                            type="button"
+                            onClick={() => {
+                              setShowHotspotOverlay(true);
+                              lastFocusedHotspotIdRef.current = mark.id;
+                              setActiveHotspotId(mark.id);
+                            }}
+                            className="rounded-full border border-slate-300 bg-slate-100 px-3 py-1 text-xs font-semibold text-gray-600 hover:bg-slate-200 focus:outline-none focus:ring-2 focus:ring-slate-300"
+                          >
+                            {mark.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
-                 <div className="relative">
-                    <button onClick={() => setIsSettingsOpen(!isSettingsOpen)} className={`p-2 rounded-full transition-colors ${isSettingsOpen ? 'bg-emerald-100 text-emerald-600' : 'hover:bg-slate-100'}`}>
-                        <SettingsIcon className="w-5 h-5" />
+              </div>
+
+              <div className="grid gap-4">
+                <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                  <p className="text-sm font-semibold text-gray-800">Aspect ratio</p>
+                  <p className="mt-1 text-xs text-gray-500">Pick the format for your next render.</p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {['original', '1:1', '16:9', '9:16'].map(option => (
+                      <button
+                        key={option}
+                        type="button"
+                        onClick={() => setAspectRatio(option)}
+                        className={`min-w-[80px] rounded-lg px-4 py-2 text-sm font-semibold transition-colors whitespace-nowrap text-center ${
+                          aspectRatio === option ? 'border border-emerald-500 bg-emerald-100 text-emerald-700 shadow-sm' : 'border border-slate-200 bg-slate-50 text-gray-600 hover:bg-white'
+                        }`}
+                      >
+                        {option === 'original' ? 'Original' : option}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm font-semibold text-gray-800">Brand palette</p>
+                    <button
+                      type="button"
+                      onClick={() => setIsSettingsOpen(true)}
+                      className="text-xs font-semibold text-emerald-600 hover:text-emerald-700"
+                    >
+                      Adjust
                     </button>
-                    {isSettingsOpen && (
-                        <div className="absolute top-full right-0 mt-2 w-72 bg-white rounded-xl shadow-lg border border-slate-200 p-4 z-10 space-y-4">
-                            <ColorPaletteSelector 
-                                selectedPalette={brandColors} 
-                                onPaletteChange={setBrandColors}
-                                userBrandColors={appUser?.brandColors} 
-                            />
-                        </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    {brandColors.length > 0 ? (
+                      brandColors.map(color => (
+                        <span
+                          key={color}
+                          className="h-7 w-7 rounded-full border border-white shadow-sm"
+                          style={{ backgroundColor: color }}
+                          title={color}
+                        />
+                      ))
+                    ) : (
+                      <p className="text-xs text-gray-500 leading-relaxed">Stick with the template colors or tap Adjust to choose your brand palette.</p>
                     )}
+                  </div>
+                  {isSettingsOpen && (
+                    <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4 shadow-lg">
+                      <ColorPaletteSelector
+                        selectedPalette={brandColors}
+                        onPaletteChange={palette => {
+                          setBrandColors(palette);
+                          setIsSettingsOpen(false);
+                        }}
+                        userBrandColors={appUser?.brandColors}
+                      />
+                    </div>
+                  )}
                 </div>
-            </div>
-
-            <div className="flex-1 overflow-y-auto px-4 pt-4 pb-6 space-y-6">
-                {chatMessages.map(msg => {
-                    if (msg.type === 'form') return <div key={msg.id}>{renderInitialEditForm()}</div>
-                    
-                    return (
-                        <div key={msg.id} className={`flex gap-3 ${msg.role === 'user' ? 'justify-end' : ''}`}>
-                            {msg.role === 'assistant' && <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center shrink-0"><SparklesIcon className="w-5 h-5 text-emerald-500"/></div>}
-                            <div className={`p-3 rounded-2xl max-w-xs md:max-w-sm break-words ${msg.role === 'user' ? 'bg-emerald-500 text-white rounded-br-xl' : msg.type === 'error' ? 'bg-red-100 text-red-800 rounded-bl-xl' : 'bg-slate-100 text-gray-800 rounded-bl-xl'}`}>
-                                {msg.text && <p>{msg.text}</p>}
-                                {msg.referenceImagePreviewUrl && <img src={msg.referenceImagePreviewUrl} alt="Reference" className="mt-2 rounded-lg max-h-40" />}
-                                {msg.generatedImageUrl && <img src={msg.generatedImageUrl} alt="Generated" className="mt-2 rounded-lg" />}
-                            </div>
-                        </div>
-                    )
-                })}
-                {isGenerating && (
-                    <div className="flex gap-3">
-                        <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center shrink-0"><SparklesIcon className="w-5 h-5 text-emerald-500 animate-spin"/></div>
-                        <div className="p-3 rounded-2xl bg-slate-100 rounded-bl-xl">
-                            <div className="flex items-center gap-2 text-gray-500">
-                                <div className="w-2 h-2 bg-gray-400 rounded-full animate-pulse" style={{animationDelay: '0s'}}></div>
-                                <div className="w-2 h-2 bg-gray-400 rounded-full animate-pulse" style={{animationDelay: '0.2s'}}></div>
-                                <div className="w-2 h-2 bg-gray-400 rounded-full animate-pulse" style={{animationDelay: '0.4s'}}></div>
-                            </div>
-                        </div>
-                    </div>
-                )}
-                <div ref={messagesEndRef} />
-            </div>
-
-            <div className="p-4 border-t border-slate-200 bg-white">
-                {!isProUser && appUser ? (
-                    <div className="text-center p-4 bg-slate-100 rounded-lg">
-                        <SparklesIcon className="w-6 h-6 text-emerald-500 mx-auto mb-2" />
-                        <h4 className="font-bold text-gray-800">Unlock Conversational Editing</h4>
-                        <p className="text-sm text-gray-600 mb-3">Upgrade to Pro to nudge the AI with quick chat tweaks and @-mentions on hotspots.</p>
-                        <button onClick={onUpgrade} className="w-full bg-emerald-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-emerald-600 transition-colors">
-                            Upgrade to Pro
-                        </button>
-                    </div>
-                ) : (
-                    <form onSubmit={handleChatEdit}>
-                        {chatAttachment && (
-                            <div className="relative p-2 mb-2 bg-slate-100 rounded-md flex items-center gap-2">
-                                <img src={chatAttachment.previewUrl} alt="Attachment preview" className="w-10 h-10 rounded object-cover" />
-                                <p className="text-xs text-gray-600 truncate flex-1">{chatAttachment.file.name}</p>
-                                <button type="button" onClick={() => setChatAttachment(null)} className="p-1 rounded-full hover:bg-slate-200 absolute top-1 right-1">
-                                    <XIcon className="w-4 h-4 text-gray-500" />
-                                </button>
-                            </div>
-                        )}
-                        <div className="relative">
-                            <textarea
-                                value={chatPrompt}
-                                onChange={(e) => setChatPrompt(e.target.value)}
-                                onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleChatEdit(e); }}}
-                                placeholder={isGenerating ? "Processing..." : isProUser ? "Use @Headline, @Logo… to target edits or describe your tweak." : "Upgrade to Pro to chat through edits."}
-                                className="w-full border border-slate-300 rounded-lg py-3 pl-10 pr-12 resize-none focus:ring-emerald-500 focus:border-emerald-500 disabled:bg-slate-50 disabled:text-gray-400"
-                                rows={2}
-                                disabled={isGenerating || !isProUser}
-                            />
-                            <button type="button" onClick={() => fileInputRef.current?.click()} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-emerald-600 disabled:text-gray-300" disabled={isGenerating}>
-                                <PaperclipIcon className="w-5 h-5" />
-                            </button>
-                            <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept="image/*" />
-                            <button type="submit" className="absolute right-3 top-1/2 -translate-y-1/2 text-emerald-600 hover:text-emerald-700 disabled:text-gray-400" disabled={!chatPrompt.trim() || isGenerating || !isProUser}>
-                                <SendIcon className="w-5 h-5" />
-                            </button>
-                        </div>
-                    </form>
-                )}
-            </div>
-        </div>
+              </div>
+            </aside>
+          </div>
         </div>
       </div>
+      {renderFloatingActions()}
       {renderChatDrawer()}
       {mentionSuggestions.length > 0 && mentionAnchor && (
         <div className="fixed z-50" style={{ top: mentionAnchor.y, left: mentionAnchor.x }}>
@@ -1343,7 +1614,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
             Unknown hotspots: {invalidMentions.join(', ')}
         </div>
       )}
-      {renderHotspotModal()}
+      {renderGenerationConfirm()}
+      {renderHotspotDrawer()}
     </div>
   );
 };

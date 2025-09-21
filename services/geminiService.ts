@@ -53,7 +53,28 @@ export const generateCreative = async (
 ): Promise<string> => {
   const ai = getAi();
   const promptParts: any[] = [];
-  
+
+  const describePlacementArea = (mark: Mark) => {
+    const width = mark.width ?? mark.scale ?? 0;
+    const height = mark.height ?? mark.scale ?? 0;
+    if (!width || !height) {
+      return 'Keep the element inside the original canvas bounds and size proportionally to match surrounding design. Treat the requested location as a strict clipping mask: any pixels outside that area would be incorrect. Absolutely no outlines or borders may be added.';
+    }
+
+    const clamp = (value: number) => Math.min(1, Math.max(0, value));
+    const left = clamp(mark.x - width / 2);
+    const top = clamp(mark.y - height / 2);
+    const right = clamp(mark.x + width / 2);
+    const bottom = clamp(mark.y + height / 2);
+
+    const fmt = (value: number) => `${Math.round(value * 100)}%`;
+    const fmtCoord = (value: number) => value.toFixed(2);
+
+    return `The element must remain fully inside the rectangular region whose center is at (x: ${mark.x.toFixed(2)}, y: ${mark.y.toFixed(2)}), with width ≈ ${fmt(width)} of the canvas and height ≈ ${fmt(height)}. The top-left corner of that rectangle is roughly at (x: ${fmtCoord(left)}, y: ${fmtCoord(top)}), and the bottom-right corner is roughly at (x: ${fmtCoord(right)}, y: ${fmtCoord(bottom)}). Treat this rectangle as a strict clipping mask: do not let any pixels extend even slightly beyond its edges, and do not shift the content above, below, left, or right of the region. No outline, stroke, drop shadow, glow, or border may appear on the edges of the new element.`;
+  };
+
+  const noBorderClause = 'Do not introduce any outline, stroke, drop shadow, glow, halo, or border around the element; it must appear naturally integrated and share the surrounding background color at the boundary.';
+
   promptParts.push({
     inlineData: {
       data: originalTemplateBase64,
@@ -97,7 +118,7 @@ export const generateCreative = async (
             }
           } else {
             // New logic for adding text
-            editInstructions.push(`- Add new text: "${newText}". Critical instructions: Place this text ON TOP of the existing template canvas. The coordinates for the center of this new text are (x: ${mark.x.toFixed(2)}, y: ${mark.y.toFixed(2)}). It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new text. The new text must be placed ENTIRELY within the original boundaries. The text's style, font, and color should match the overall aesthetic of the template.`);
+            editInstructions.push(`- Add new text: "${newText}". Critical instructions: Place this text ON TOP of the existing template canvas. ${describePlacementArea(mark)} Keep the text horizontally and vertically centered inside that region. The baseline should sit midway between the top and bottom edges of the rectangle. ${noBorderClause} It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new text. The text's style, font, kerning, leading, and color should match the overall aesthetic of the template.`);
           }
       }
     } else if (mark.type === 'image') {
@@ -109,13 +130,13 @@ export const generateCreative = async (
          if (isExistingMark) {
            editInstructions.push(`- Replace the image labeled '${mark.label}' with the user's new provided '${mark.label}' image. The new image's lighting, shadows, perspective, and reflections MUST perfectly match the surrounding scene.`);
          } else {
-            editInstructions.push(`- Add a new image for '${mark.label}'. Critical instructions: Place this image ON TOP of the existing template canvas. The coordinates for the center of this new image are (x: ${mark.x.toFixed(2)}, y: ${mark.y.toFixed(2)}). ${sizeInstruction} It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new image. The new image must be placed ENTIRELY within the original boundaries. Adjust the new image's lighting, shadows, and perspective to perfectly match the surrounding scene.`);
+            editInstructions.push(`- Add a new image for '${mark.label}'. Critical instructions: Place this image ON TOP of the existing template canvas. ${describePlacementArea(mark)} ${sizeInstruction} ${noBorderClause} Snap the image so its edges align with the rectangle while staying fully inside it (use subtle feathering instead of hard outlines). It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new image. The new image must be placed ENTIRELY within the original boundaries. Adjust the new image's lighting, shadows, and perspective to perfectly match the surrounding scene.`);
          }
        } else if (mode === 'describe' && description) {
          if (isExistingMark) {
             editInstructions.push(`- Replace the image labeled '${mark.label}' with a new image that matches this description: ${description}. Ensure lighting, shadows, and perspective align perfectly with the existing design.`);
          } else {
-            editInstructions.push(`- Add a new image for '${mark.label}' based on this description: ${description}. Place it ON TOP of the existing template canvas at coordinates (x: ${mark.x.toFixed(2)}, y: ${mark.y.toFixed(2)}). ${sizeInstruction} Do not alter the template dimensions; keep the new element entirely within the original boundaries and match the surrounding lighting and perspective.`);
+            editInstructions.push(`- Add a new image for '${mark.label}' based on this description: ${description}. Place it ON TOP of the existing template canvas. ${describePlacementArea(mark)} ${sizeInstruction} ${noBorderClause} Snap the image so its edges align with the rectangle while staying fully inside it. Do not alter the template dimensions; keep the new element entirely within the original boundaries and match the surrounding lighting and perspective.`);
          }
        }
     }
@@ -133,6 +154,7 @@ export const generateCreative = async (
     1.  **DO NOT RECREATE:** You are only modifying small, specified parts of the template. The rest of the image MUST remain identical to the original.
     2.  **ABSOLUTE DIMENSION LOCK:** It is absolutely forbidden to alter the original template's dimensions or aspect ratio unless an explicit 'Aspect Ratio Requirement' is given below. Do NOT expand, crop, or change the canvas size to fit new elements. New elements are always placed ON TOP of the existing canvas, within its original boundaries. This is the most important rule.
     3.  **SEAMLESS INTEGRATION:** All new or replaced elements (text and images) must be perfectly integrated. Match the original template's lighting, perspective, style, and quality.
+    4.  **BOUNDING BOX COMPLIANCE:** When a rectangle or placement region is described, treat it as an exact clipping mask. The new element must stay fully inside its edges with no drift. If the request mentions centering, keep the element centered in both axes within that region. Never add borders, strokes, halos, or shadows around the region.
 
     **Task Description from Original Brief:** ${basePrompt}
         
