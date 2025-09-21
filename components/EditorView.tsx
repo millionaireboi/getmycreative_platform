@@ -1395,6 +1395,14 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                     const top = ((mark.y - (mark.height ?? 0) / 2)) * 100;
                     const width = (mark.width ?? 0) * 100;
                     const height = (mark.height ?? 0) * 100;
+                    const textContent = mark.type === 'text'
+                      ? (textFields[mark.id] ?? mark.text ?? '')
+                      : '';
+                    const hasTextContent = mark.type === 'text' && textContent.trim().length > 0;
+                    const imagePreviewUrl = mark.type === 'image'
+                      ? (imageAssets[mark.id]?.previewUrl ?? '')
+                      : '';
+                    const hasImageContent = mark.type === 'image' && imagePreviewUrl.trim().length > 0;
                     return (
                       <button
                         key={mark.id}
@@ -1416,6 +1424,18 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                         <span className="absolute -top-5 left-0 rounded-full bg-black/80 px-1.5 py-0.5 text-xs text-white backdrop-blur-sm shadow-md">
                           {mark.label}
                         </span>
+                        {hasTextContent && (
+                          <div className="hotspot-content">
+                            <div className="whitespace-pre-wrap text-xs font-semibold leading-snug text-white mix-blend-difference drop-shadow">
+                              {textContent}
+                            </div>
+                          </div>
+                        )}
+                        {hasImageContent && (
+                          <div className="hotspot-content">
+                            <img src={imagePreviewUrl} alt={`${mark.label} preview`} />
+                          </div>
+                        )}
                         <span className={`absolute inset-0 pointer-events-none border-2 border-dashed mix-blend-difference ${hoveredMarkId === mark.id ? 'border-emerald-600/80' : 'border-white/80'}`} />
                       </button>
                     );

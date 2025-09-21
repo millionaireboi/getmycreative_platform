@@ -54,6 +54,10 @@ export const generateCreative = async (
   const ai = getAi();
   const promptParts: any[] = [];
 
+  const escapeSingleQuotes = (value: string) => value.replace(/'/g, "\\'");
+  const newTextHotspots: string[] = [];
+  const newImageHotspots: string[] = [];
+
   const describePlacementArea = (mark: Mark) => {
     const width = mark.width ?? mark.scale ?? 0;
     const height = mark.height ?? mark.scale ?? 0;
@@ -118,7 +122,8 @@ export const generateCreative = async (
             }
           } else {
             // New logic for adding text
-            editInstructions.push(`- Add new text: "${newText}". Critical instructions: Place this text ON TOP of the existing template canvas. ${describePlacementArea(mark)} Keep the text horizontally and vertically centered inside that region. The baseline should sit midway between the top and bottom edges of the rectangle. ${noBorderClause} It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new text. The text's style, font, kerning, leading, and color should match the overall aesthetic of the template.`);
+            editInstructions.push(`- Add a brand-new text element for '${mark.label}' inside the designated hotspot. This MUST create additional copy without replacing or hiding any existing text elsewhere in the creative. Insert exactly: "${newText}". Critical instructions: Place this text ON TOP of the existing template canvas. ${describePlacementArea(mark)} Keep the text horizontally and vertically centered inside that region. The baseline should sit midway between the top and bottom edges of the rectangle. ${noBorderClause} It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new text. The text's style, font, kerning, leading, and color should match the overall aesthetic of the template.`);
+            newTextHotspots.push(newText);
           }
       }
     } else if (mark.type === 'image') {
@@ -130,13 +135,15 @@ export const generateCreative = async (
          if (isExistingMark) {
            editInstructions.push(`- Replace the image labeled '${mark.label}' with the user's new provided '${mark.label}' image. The new image's lighting, shadows, perspective, and reflections MUST perfectly match the surrounding scene.`);
          } else {
-            editInstructions.push(`- Add a new image for '${mark.label}'. Critical instructions: Place this image ON TOP of the existing template canvas. ${describePlacementArea(mark)} ${sizeInstruction} ${noBorderClause} Snap the image so its edges align with the rectangle while staying fully inside it (use subtle feathering instead of hard outlines). It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new image. The new image must be placed ENTIRELY within the original boundaries. Adjust the new image's lighting, shadows, and perspective to perfectly match the surrounding scene.`);
+            editInstructions.push(`- Add a brand-new image element for '${mark.label}' inside the described hotspot. This MUST be additional artwork layered on top of the existing design; do not remove or overwrite surrounding imagery. Critical instructions: Place this image ON TOP of the existing template canvas. ${describePlacementArea(mark)} ${sizeInstruction} ${noBorderClause} Snap the image so its edges align with the rectangle while staying fully inside it (use subtle feathering instead of hard outlines). It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new image. The new image must be placed ENTIRELY within the original boundaries. Adjust the new image's lighting, shadows, and perspective to perfectly match the surrounding scene.`);
+            newImageHotspots.push(mark.label);
          }
        } else if (mode === 'describe' && description) {
          if (isExistingMark) {
             editInstructions.push(`- Replace the image labeled '${mark.label}' with a new image that matches this description: ${description}. Ensure lighting, shadows, and perspective align perfectly with the existing design.`);
          } else {
-            editInstructions.push(`- Add a new image for '${mark.label}' based on this description: ${description}. Place it ON TOP of the existing template canvas. ${describePlacementArea(mark)} ${sizeInstruction} ${noBorderClause} Snap the image so its edges align with the rectangle while staying fully inside it. Do not alter the template dimensions; keep the new element entirely within the original boundaries and match the surrounding lighting and perspective.`);
+            editInstructions.push(`- Add a brand-new image element for '${mark.label}' based on this description: ${description}. This must be additional artwork that coexists with the original design—do not delete or repaint existing elements. Place it ON TOP of the existing template canvas. ${describePlacementArea(mark)} ${sizeInstruction} ${noBorderClause} Snap the image so its edges align with the rectangle while staying fully inside it. Do not alter the template dimensions; keep the new element entirely within the original boundaries and match the surrounding lighting and perspective.`);
+            newImageHotspots.push(mark.label);
          }
        }
     }
@@ -147,6 +154,30 @@ export const generateCreative = async (
     ? "The output image's aspect ratio and dimensions MUST EXACTLY match the original template's."
     : `The output image MUST have a final aspect ratio of ${aspectRatio}. Adapt the template's layout to fit this new aspect ratio gracefully.`;
 
+  const hasNewHotspots = newTextHotspots.length > 0 || newImageHotspots.length > 0;
+  const newHotspotDirective = hasNewHotspots
+    ? `    5.  **NEW HOTSPOT CONTENT:** When instructions say "add" or reference a new hotspot, treat that rectangle as an empty layer that needs fresh content. Keep all existing text, logos, and imagery untouched. Generate only the new element within the specified bounds—never rewrite, remove, or restyle other parts of the creative.`
+    : '';
+
+  const fewShotBase = hasNewHotspots
+    ? [
+        "User input: 'Add new text: Happy Holidays'. Expected Output: 'Happy Holidays'.",
+        "User input: 'Add new text: 20% Off'. Expected Output: '20% Off'."
+      ]
+    : [];
+
+  const fewShotForNewText = newTextHotspots.map(text => {
+    const escaped = escapeSingleQuotes(text.trim());
+    return `User input: 'Add new text: ${escaped}'. Expected Output: '${escaped}'.`;
+  });
+
+  const fewShotGuidance = (fewShotBase.length + fewShotForNewText.length) > 0
+    ? `
+    **Few-shot guidance for new text hotspots:**
+    ${[...fewShotBase, ...fewShotForNewText].join('\n    ')}
+  `
+    : '';
+
   const textPrompt = `
     You are a precise and expert creative director AI. Your task is to perform specific in-place edits on a template image. You must follow all instructions exactly.
 
@@ -155,6 +186,7 @@ export const generateCreative = async (
     2.  **ABSOLUTE DIMENSION LOCK:** It is absolutely forbidden to alter the original template's dimensions or aspect ratio unless an explicit 'Aspect Ratio Requirement' is given below. Do NOT expand, crop, or change the canvas size to fit new elements. New elements are always placed ON TOP of the existing canvas, within its original boundaries. This is the most important rule.
     3.  **SEAMLESS INTEGRATION:** All new or replaced elements (text and images) must be perfectly integrated. Match the original template's lighting, perspective, style, and quality.
     4.  **BOUNDING BOX COMPLIANCE:** When a rectangle or placement region is described, treat it as an exact clipping mask. The new element must stay fully inside its edges with no drift. If the request mentions centering, keep the element centered in both axes within that region. Never add borders, strokes, halos, or shadows around the region.
+${newHotspotDirective ? `\n${newHotspotDirective}` : ''}
 
     **Task Description from Original Brief:** ${basePrompt}
         
@@ -162,6 +194,7 @@ export const generateCreative = async (
 
     **SPECIFIC EDITING TASKS:**
     ${editInstructions.length > 0 ? editInstructions.join('\n') : "No specific edits requested. Generate the creative based on the original brief and aspect ratio."}
+    ${fewShotGuidance}
     ---
   `;
   
