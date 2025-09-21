@@ -3,11 +3,32 @@ import { UITemplate, BrandAsset, GeneratedImage, Mark, ChatMessage } from '../ty
 import { generateCreative, editCreativeWithChat, ChatEditOptions } from '../services/geminiService.ts';
 import { fileToBase64, downloadImage, imageUrlToBase64, base64ToBlob } from '../utils/fileUtils.ts';
 import { SparklesIcon, ArrowLeftIcon, DownloadIcon, PaperclipIcon, SendIcon, PaletteIcon, XIcon, UploadCloudIcon, TrashIcon, EditIcon } from './icons.tsx';
+import CreativeElement from './CreativeElement.tsx';
+
 import { BRAND_PALETTES } from '../constants.ts';
 import { useAuth } from '../contexts/AuthContext.tsx';
 import { SubscriptionTier, Project } from '../core/types/index.ts';
 import { createProject, updateProjectHistory, updateProjectName } from '../core/systems/projectStore.ts';
 import { uploadFileToStorage } from '../firebase/config.ts';
+
+
+const DEFAULT_HOTSPOT_LABEL: Record<'text' | 'image', string> = {
+  text: 'New text hotspot',
+  image: 'New image hotspot',
+};
+
+const resolveHotspotDisplayLabel = (mark: Mark): string => {
+  const raw = (mark.label ?? '').trim();
+  if (!raw || raw === DEFAULT_HOTSPOT_LABEL[mark.type]) {
+    return mark.type === 'text' ? 'Text hotspot' : 'Image hotspot';
+  }
+  return raw;
+};
+
+const isHotspotLabelPending = (mark: Mark): boolean => {
+  const raw = (mark.label ?? '').trim();
+  return !raw || raw === DEFAULT_HOTSPOT_LABEL[mark.type];
+};
 
 
 const buildChatMessagesForState = (isProUser: boolean): ChatMessage[] => [
@@ -110,7 +131,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     const map: Record<string, string> = {};
     initialMarksSource.forEach(mark => {
         if (mark.type === 'text') {
-            map[mark.id] = mark.text || `Your ${mark.label} Here`;
+            map[mark.id] = mark.text || `Your ${resolveHotspotDisplayLabel(mark)} Here`;
         }
     });
     return map;
@@ -175,6 +196,57 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     return map;
   }, [originalMarks]);
 
+  const updateMarkLabel = useCallback((markId: string, nextLabel: string) => {
+    setMarks(prev => prev.map(mark => (mark.id === markId ? { ...mark, label: nextLabel } : mark)));
+  }, []);
+
+  const canEnableMark = useCallback((markId: string, overrides?: {
+    label?: string;
+    text?: string;
+    asset?: BrandAsset | null;
+    prompt?: string;
+    mode?: 'upload' | 'describe';
+  }) => {
+    const mark = marks.find(m => m.id === markId);
+    if (!mark) return false;
+
+    const labelRaw = overrides?.label !== undefined ? overrides.label ?? '' : mark.label ?? '';
+    const labelTrimmed = labelRaw.trim();
+    if (!labelTrimmed || labelTrimmed === DEFAULT_HOTSPOT_LABEL[mark.type]) {
+      return false;
+    }
+
+    if (mark.type === 'text') {
+      const textRaw = overrides?.text !== undefined ? overrides.text ?? '' : textFields[markId] ?? '';
+      const trimmed = textRaw.trim();
+      if (!trimmed) return false;
+      const originalTrimmed = (originalMarksMap[markId]?.text ?? '').trim();
+      if (!mark.isNew && originalTrimmed && trimmed === originalTrimmed) {
+        return false;
+      }
+      return true;
+    }
+
+    const modeValue = overrides?.mode ?? imageModes[markId] ?? 'upload';
+    if (modeValue === 'upload') {
+      const assetValue = overrides?.asset !== undefined ? overrides.asset : imageAssets[markId] ?? null;
+      return !!assetValue;
+    }
+
+    const promptRaw = overrides?.prompt !== undefined ? overrides.prompt ?? '' : imagePrompts[markId] ?? '';
+    return promptRaw.trim().length > 0;
+  }, [marks, textFields, imageAssets, imagePrompts, imageModes, originalMarksMap]);
+
+  const applyMarkEnabledFromContent = useCallback((markId: string, overrides?: {
+    label?: string;
+    text?: string;
+    asset?: BrandAsset | null;
+    prompt?: string;
+    mode?: 'upload' | 'describe';
+  }) => {
+    setEnabledMarks(prev => ({ ...prev, [markId]: canEnableMark(markId, overrides) }));
+  }, [canEnableMark]);
+
   const applyMarksFromSource = useCallback((sourceMarks: Mark[]) => {
     setMarks(sourceMarks);
     setEnabledMarks(() => {
@@ -188,7 +260,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         const map: Record<string, string> = {};
         sourceMarks.forEach(mark => {
             if (mark.type === 'text') {
-                map[mark.id] = mark.text || `Your ${mark.label} Here`;
+                map[mark.id] = mark.text || `Your ${resolveHotspotDisplayLabel(mark)} Here`;
             }
         });
         return map;
@@ -217,7 +289,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const mentionTokens = useMemo(() => {
     return marks.map(mark => ({
         id: mark.id,
-        label: mark.label,
+        label: resolveHotspotDisplayLabel(mark),
         type: mark.type,
         isIncluded: !!enabledMarks[mark.id]
     }));
@@ -246,6 +318,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const canvasHotspotRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const lastFocusedHotspotIdRef = useRef<string | null>(null);
   const drawStartRef = useRef<{ x: number; y: number; id: string; label: string } | null>(null);
+  const drawerLabelInputRef = useRef<HTMLInputElement | null>(null);
   const drawerIncludeButtonRef = useRef<HTMLButtonElement | null>(null);
   const drawerTextAreaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -405,10 +478,22 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
   useEffect(() => {
     if (!activeMark) {
+        drawerLabelInputRef.current = null;
         drawerIncludeButtonRef.current = null;
         drawerTextAreaRef.current = null;
         return;
     }
+
+    const labelInput = drawerLabelInputRef.current;
+    if (isHotspotLabelPending(activeMark)) {
+        labelInput?.focus();
+        return;
+    }
+
+    if (labelInput && document.activeElement === labelInput) {
+        return;
+    }
+
     const activeMode = imageModes[activeMark.id] || 'upload';
     if (activeMark.type === 'text' || (activeMark.type === 'image' && activeMode === 'describe')) {
         drawerTextAreaRef.current?.focus();
@@ -475,7 +560,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     });
 
     try {
-      const { base64: templateBase64, mimeType: templateMimeType } = await imageUrlToBase64(templateImageUrl);
+      const { base64: templateBase64, mimeType: templateMimeType, width: templateWidth, height: templateHeight } = await imageUrlToBase64(templateImageUrl);
       
       const resultBase64 = await generateCreative(
         templateBase64,
@@ -488,7 +573,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         enabledMarks,
         aspectRatio,
         marks,
-        originalMarks
+        originalMarks,
+        { width: templateWidth, height: templateHeight }
       );
 
       const imageBlob = base64ToBlob(resultBase64, 'image/png');
@@ -654,7 +740,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setShowHotspotOverlay(true);
     setIsDrawingMark(true);
 
-    const label = `New ${isPlacingMark.charAt(0).toUpperCase() + isPlacingMark.slice(1)}`;
+    const label = DEFAULT_HOTSPOT_LABEL[isPlacingMark];
     const id = `${isPlacingMark}-${Date.now()}`;
     drawStartRef.current = { ...point, id, label };
     setDraftMark({
@@ -712,7 +798,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setMarks(prev => [...prev, newMark]);
     setEnabledMarks(prev => ({ ...prev, [newMark.id]: false }));
     if (newMark.type === 'text') {
-        setTextFields(prev => ({ ...prev, [newMark.id]: 'Your new text here' }));
+        setTextFields(prev => ({ ...prev, [newMark.id]: '' }));
     }
     if (newMark.type === 'image') {
         setImageModes(prev => ({ ...prev, [newMark.id]: 'upload' }));
@@ -749,23 +835,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const ignoredMarks = useMemo(() => marks.filter(mark => !enabledMarks[mark.id]), [marks, enabledMarks]);
 
   const readyIncludedMarks = useMemo(() => {
-    return includedMarks.filter(mark => {
-        if (mark.type === 'text') {
-            const text = textFields[mark.id];
-            return !!(text && text.trim().length > 0);
-        }
-        if (mark.type === 'image') {
-            const asset = imageAssets[mark.id];
-            const prompt = imagePrompts[mark.id];
-            const mode = imageModes[mark.id] || 'upload';
-            if (mode === 'upload') {
-                return !!asset;
-            }
-            return !!(prompt && prompt.trim().length > 0);
-        }
-        return false;
-    });
-  }, [includedMarks, textFields, imageAssets, imagePrompts, imageModes]);
+    return includedMarks.filter(mark => canEnableMark(mark.id));
+  }, [includedMarks, canEnableMark]);
 
   const missingIncludedMarks = useMemo(() => {
     const readyIds = new Set(readyIncludedMarks.map(mark => mark.id));
@@ -881,12 +952,32 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     const currentPrompt = imagePrompts[markId] || '';
     const originalMark = originalMarksMap[markId];
     const originalText = originalMark?.text || '';
+    const displayLabel = resolveHotspotDisplayLabel(activeMark);
+    const labelPending = isHotspotLabelPending(activeMark);
+    const includeReady = canEnableMark(markId);
 
     const handleClose = () => setActiveHotspotId(null);
-    const toggleInclude = () => setEnabledMarks(prev => ({ ...prev, [markId]: !prev[markId] }));
+    const handleLabelChange = (value: string) => {
+        updateMarkLabel(markId, value);
+        applyMarkEnabledFromContent(markId, { label: value });
+    };
+    const toggleInclude = () => {
+        setEnabledMarks(prev => {
+            const current = !!prev[markId];
+            if (current) {
+                return { ...prev, [markId]: false };
+            }
+            if (!canEnableMark(markId)) {
+                return prev;
+            }
+            return { ...prev, [markId]: true };
+        });
+    };
     const handleReset = () => {
         if (isText) {
-            setTextFields(prev => ({ ...prev, [markId]: originalText || '' }));
+            const resetValue = originalText || '';
+            setTextFields(prev => ({ ...prev, [markId]: resetValue }));
+            applyMarkEnabledFromContent(markId, { text: resetValue });
         } else if (isImage) {
             setImageAssets(prev => {
                 const next = { ...prev };
@@ -894,11 +985,15 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                 return next;
             });
             setImagePrompts(prev => ({ ...prev, [markId]: '' }));
+            applyMarkEnabledFromContent(markId, { asset: null, prompt: '', mode });
+        } else {
+            applyMarkEnabledFromContent(markId, {});
         }
-        setEnabledMarks(prev => ({ ...prev, [markId]: false }));
     };
 
     const handleModeChange = (nextMode: 'upload' | 'describe') => {
+        const currentAssetForMark = imageAssets[markId] ?? null;
+        const currentPromptForMark = imagePrompts[markId] ?? '';
         setImageModes(prev => ({ ...prev, [markId]: nextMode }));
         if (nextMode === 'describe') {
             setImageAssets(prev => {
@@ -906,16 +1001,17 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                 delete next[markId];
                 return next;
             });
-            setEnabledMarks(prev => ({ ...prev, [markId]: false }));
+            applyMarkEnabledFromContent(markId, { mode: nextMode, prompt: currentPromptForMark, asset: null });
         } else {
             drawerTextAreaRef.current = null;
+            applyMarkEnabledFromContent(markId, { mode: nextMode, asset: currentAssetForMark });
         }
     };
 
     const handleAssetUpload = (asset: BrandAsset) => {
         setImageAssets(prev => ({ ...prev, [markId]: asset }));
         setImageModes(prev => ({ ...prev, [markId]: 'upload' }));
-        setEnabledMarks(prev => ({ ...prev, [markId]: true }));
+        applyMarkEnabledFromContent(markId, { asset, mode: 'upload' });
     };
 
     const handleAssetClear = () => {
@@ -924,7 +1020,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
             delete next[markId];
             return next;
         });
-        setEnabledMarks(prev => ({ ...prev, [markId]: false }));
+        applyMarkEnabledFromContent(markId, { asset: null });
     };
 
     return (
@@ -934,7 +1030,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                 <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-5 py-4">
                     <div className="space-y-1">
                         <p className="text-xs font-semibold uppercase tracking-wide text-emerald-600">{isText ? 'Text hotspot' : 'Image hotspot'}</p>
-                        <h3 className="text-2xl font-bold text-gray-900 font-display">{activeMark.label}</h3>
+                        <h3 className="text-2xl font-bold text-gray-900 font-display">{displayLabel}</h3>
                     </div>
                     <button onClick={handleClose} className="rounded-full p-2 text-gray-500 hover:bg-slate-100" aria-label="Close hotspot drawer">
                         <XIcon className="h-5 w-5" />
@@ -942,17 +1038,32 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                 </div>
 
                 <div className="flex-1 space-y-6 overflow-y-auto px-5 py-6">
+                    <div className="space-y-2">
+                        <label className="text-sm font-semibold text-gray-800" htmlFor={`hotspot-label-${markId}`}>Hotspot name</label>
+                        <input
+                            id={`hotspot-label-${markId}`}
+                            ref={drawerLabelInputRef}
+                            value={activeMark.label ?? ''}
+                            onChange={event => handleLabelChange(event.target.value)}
+                            type="text"
+                            placeholder={isText ? 'e.g. Headline' : 'e.g. Product photo'}
+                            className={`w-full rounded-xl border px-4 py-2 text-sm focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500 ${labelPending ? 'border-amber-400 bg-amber-50/60' : 'border-slate-300 bg-white'}`}
+                        />
+                        <p className={`text-xs ${labelPending ? 'text-amber-600' : 'text-gray-500'}`}>{labelPending ? 'Give this hotspot a clear name so the AI knows what to edit.' : 'This name is used for @mentions and generation instructions.'}</p>
+                    </div>
+
                     <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
                         <div>
                             <p className="text-xs font-semibold uppercase text-gray-600">Include in next render</p>
-                            <p className="text-xs text-gray-500">{isEnabled ? 'This hotspot will be considered when you generate.' : 'Temporarily ignore this hotspot.'}</p>
+                            <p className="text-xs text-gray-500">{isEnabled ? 'This hotspot will be considered when you generate.' : includeReady ? 'Temporarily ignore this hotspot.' : 'Name it and add content before including.'}</p>
                         </div>
                         <button
                             type="button"
                             ref={drawerIncludeButtonRef}
                             onClick={toggleInclude}
                             aria-pressed={isEnabled}
-                            className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 ${isEnabled ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-gray-600'}`}
+                            disabled={!includeReady && !isEnabled}
+                            className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 ${isEnabled ? 'bg-emerald-100 text-emerald-700' : includeReady ? 'bg-slate-200 text-gray-600' : 'bg-slate-200/80 text-gray-400'}`}
                         >
                             {isEnabled ? 'Included' : 'Ignored'}
                         </button>
@@ -967,13 +1078,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                                 value={textFields[markId] || ''}
                                 onChange={e => {
                                     const nextValue = e.target.value;
-                                    const trimmed = nextValue.trim();
-                                    const originalTrimmed = (originalText || '').trim();
                                     setTextFields(prev => ({ ...prev, [markId]: nextValue }));
-                                    setEnabledMarks(prev => ({
-                                        ...prev,
-                                        [markId]: trimmed.length > 0 ? (trimmed !== originalTrimmed || prev[markId]) : false
-                                    }));
+                                    applyMarkEnabledFromContent(markId, { text: nextValue });
                                 }}
                                 rows={activeMark.label.toLowerCase().includes('body') ? 4 : 2}
                                 placeholder="Enter the text you want to appear in this spot"
@@ -1027,11 +1133,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                                         onChange={e => {
                                             const nextValue = e.target.value;
                                             setImagePrompts(prev => ({ ...prev, [markId]: nextValue }));
-                                            const trimmed = nextValue.trim();
-                                            setEnabledMarks(prev => ({
-                                                ...prev,
-                                                [markId]: trimmed.length > 0 ? true : prev[markId]
-                                            }));
+                                            applyMarkEnabledFromContent(markId, { prompt: nextValue, mode: 'describe' });
                                         }}
                                         rows={4}
                                         placeholder="Describe the image you want here (colors, subject, style, lighting, etc.)"
@@ -1096,7 +1198,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                         {pendingExcludedMarks.map(mark => (
                             <li key={mark.id} className="flex gap-2">
                                 <span className="text-gray-400">-</span>
-                                <span>{mark.label}</span>
+                                <span>{resolveHotspotDisplayLabel(mark)}</span>
                             </li>
                         ))}
                     </ul>
@@ -1403,41 +1505,30 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                       ? (imageAssets[mark.id]?.previewUrl ?? '')
                       : '';
                     const hasImageContent = mark.type === 'image' && imagePreviewUrl.trim().length > 0;
+                    const displayLabel = resolveHotspotDisplayLabel(mark);
                     return (
-                      <button
+                      <CreativeElement
                         key={mark.id}
                         data-hotspot-button="true"
                         ref={el => {
                           canvasHotspotRefs.current[mark.id] = el;
                         }}
                         type="button"
+                        aria-label={`Edit hotspot ${displayLabel}`}
+                        style={{ left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%` }}
                         onClick={() => {
                           lastFocusedHotspotIdRef.current = mark.id;
                           setActiveHotspotId(mark.id);
                         }}
                         onMouseEnter={() => setHoveredMarkId(mark.id)}
                         onMouseLeave={() => setHoveredMarkId(null)}
-                        aria-label={`Edit hotspot ${mark.label}`}
-                        className={`absolute rounded-sm transition-all pointer-events-auto ${hoveredMarkId === mark.id ? 'bg-emerald-400/20 ring-2 ring-emerald-500/80' : 'bg-black/0 ring-1 ring-white/70'} focus:outline-none focus:ring-2 focus:ring-emerald-400/80`}
-                        style={{ left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%` }}
-                      >
-                        <span className="absolute -top-5 left-0 rounded-full bg-black/80 px-1.5 py-0.5 text-xs text-white backdrop-blur-sm shadow-md">
-                          {mark.label}
-                        </span>
-                        {hasTextContent && (
-                          <div className="hotspot-content">
-                            <div className="whitespace-pre-wrap text-xs font-semibold leading-snug text-white mix-blend-difference drop-shadow">
-                              {textContent}
-                            </div>
-                          </div>
-                        )}
-                        {hasImageContent && (
-                          <div className="hotspot-content">
-                            <img src={imagePreviewUrl} alt={`${mark.label} preview`} />
-                          </div>
-                        )}
-                        <span className={`absolute inset-0 pointer-events-none border-2 border-dashed mix-blend-difference ${hoveredMarkId === mark.id ? 'border-emerald-600/80' : 'border-white/80'}`} />
-                      </button>
+                        label={displayLabel}
+                        elementType={mark.type}
+                        textContent={hasTextContent ? textContent : undefined}
+                        imageSrc={hasImageContent ? imagePreviewUrl : undefined}
+                        isActive={activeHotspotId === mark.id}
+                        isHovered={hoveredMarkId === mark.id}
+                      />
                     );
                   })}
                   {draftMark && (
@@ -1516,7 +1607,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                             }}
                             className="rounded-full border border-amber-300 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700 hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-300"
                           >
-                            {mark.label}
+                            {resolveHotspotDisplayLabel(mark)}
                           </button>
                         ))}
                       </div>
@@ -1539,7 +1630,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                             }}
                             className="rounded-full border border-slate-300 bg-slate-100 px-3 py-1 text-xs font-semibold text-gray-600 hover:bg-slate-200 focus:outline-none focus:ring-2 focus:ring-slate-300"
                           >
-                            {mark.label}
+                            {resolveHotspotDisplayLabel(mark)}
                           </button>
                         ))}
                       </div>

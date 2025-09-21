@@ -5,6 +5,25 @@ import { GoogleGenAI, Modality, Type } from "@google/genai";
 import { BrandAsset, Mark } from '../core/types/shared.ts';
 import { ALL_TAGS } from "../constants.ts";
 
+type PlacementGeometry = {
+  widthNorm: number;
+  heightNorm: number;
+  leftNorm: number;
+  rightNorm: number;
+  topNorm: number;
+  bottomNorm: number;
+  centerXNorm: number;
+  centerYNorm: number;
+  widthPx: number;
+  heightPx: number;
+  leftPx: number;
+  rightPx: number;
+  topPx: number;
+  bottomPx: number;
+  centerXpx: number;
+  centerYpx: number;
+};
+
 // Prefer Vite-style env var; fall back to legacy define for compatibility.
 const API_KEY = (import.meta as any).env?.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
 
@@ -49,7 +68,8 @@ export const generateCreative = async (
   enabledMarks: Record<string, boolean>,
   aspectRatio: string,
   marks: Mark[],
-  initialMarks: Mark[]
+  initialMarks: Mark[],
+  canvasDimensions?: { width: number; height: number }
 ): Promise<string> => {
   const ai = getAi();
   const promptParts: any[] = [];
@@ -58,26 +78,215 @@ export const generateCreative = async (
   const newTextHotspots: string[] = [];
   const newImageHotspots: string[] = [];
 
-  const describePlacementArea = (mark: Mark) => {
-    const width = mark.width ?? mark.scale ?? 0;
-    const height = mark.height ?? mark.scale ?? 0;
-    if (!width || !height) {
-      return 'Keep the element inside the original canvas bounds and size proportionally to match surrounding design. Treat the requested location as a strict clipping mask: any pixels outside that area would be incorrect. Absolutely no outlines or borders may be added.';
-    }
+  const canvasWidth = canvasDimensions?.width ?? 0;
+  const canvasHeight = canvasDimensions?.height ?? 0;
+  const hasCanvasDimensions = canvasWidth > 0 && canvasHeight > 0;
+  const alignmentTolerancePx = hasCanvasDimensions ? Math.max(Math.round(Math.max(canvasWidth, canvasHeight) * 0.01), 8) : 0;
 
-    const clamp = (value: number) => Math.min(1, Math.max(0, value));
-    const left = clamp(mark.x - width / 2);
-    const top = clamp(mark.y - height / 2);
-    const right = clamp(mark.x + width / 2);
-    const bottom = clamp(mark.y + height / 2);
-
-    const fmt = (value: number) => `${Math.round(value * 100)}%`;
-    const fmtCoord = (value: number) => value.toFixed(2);
-
-    return `The element must remain fully inside the rectangular region whose center is at (x: ${mark.x.toFixed(2)}, y: ${mark.y.toFixed(2)}), with width ≈ ${fmt(width)} of the canvas and height ≈ ${fmt(height)}. The top-left corner of that rectangle is roughly at (x: ${fmtCoord(left)}, y: ${fmtCoord(top)}), and the bottom-right corner is roughly at (x: ${fmtCoord(right)}, y: ${fmtCoord(bottom)}). Treat this rectangle as a strict clipping mask: do not let any pixels extend even slightly beyond its edges, and do not shift the content above, below, left, or right of the region. No outline, stroke, drop shadow, glow, or border may appear on the edges of the new element.`;
+  const clampNormalized = (value: number) => Math.min(1, Math.max(0, value));
+  const readableLabel = (mark: Mark) => {
+    const label = mark.label?.trim();
+    return label && label.length > 0 ? label : mark.id;
   };
 
-  const noBorderClause = 'Do not introduce any outline, stroke, drop shadow, glow, halo, or border around the element; it must appear naturally integrated and share the surrounding background color at the boundary.';
+  const computeGeometry = (mark: Mark): PlacementGeometry | null => {
+    if (!hasCanvasDimensions) {
+      return null;
+    }
+
+    const rawWidth = mark.width ?? mark.scale ?? 0;
+    const rawHeight = mark.height ?? mark.scale ?? 0;
+    const widthNorm = clampNormalized(rawWidth);
+    const heightNorm = clampNormalized(rawHeight);
+
+    if (widthNorm <= 0 || heightNorm <= 0) {
+      return null;
+    }
+
+    const centerXNorm = clampNormalized(mark.x);
+    const centerYNorm = clampNormalized(mark.y);
+    const halfWidth = widthNorm / 2;
+    const halfHeight = heightNorm / 2;
+    const leftNorm = clampNormalized(centerXNorm - halfWidth);
+    const rightNorm = clampNormalized(centerXNorm + halfWidth);
+    const topNorm = clampNormalized(centerYNorm - halfHeight);
+    const bottomNorm = clampNormalized(centerYNorm + halfHeight);
+
+    const widthPx = Math.max(1, Math.round(widthNorm * canvasWidth));
+    const heightPx = Math.max(1, Math.round(heightNorm * canvasHeight));
+    const leftPx = Math.round(leftNorm * canvasWidth);
+    const rightPx = Math.round(rightNorm * canvasWidth);
+    const topPx = Math.round(topNorm * canvasHeight);
+    const bottomPx = Math.round(bottomNorm * canvasHeight);
+    const centerXpx = Math.round(centerXNorm * canvasWidth);
+    const centerYpx = Math.round(centerYNorm * canvasHeight);
+
+    return {
+      widthNorm,
+      heightNorm,
+      leftNorm,
+      rightNorm,
+      topNorm,
+      bottomNorm,
+      centerXNorm,
+      centerYNorm,
+      widthPx,
+      heightPx,
+      leftPx,
+      rightPx,
+      topPx,
+      bottomPx,
+      centerXpx,
+      centerYpx,
+    };
+  };
+
+  const geometryMap = new Map<string, PlacementGeometry>();
+  marks.forEach(mark => {
+    const geometry = computeGeometry(mark);
+    if (geometry) {
+      geometryMap.set(mark.id, geometry);
+    }
+  });
+
+  const contextMarksForHints = initialMarks.length > 0 ? initialMarks : marks;
+
+  const getGeometryFor = (mark: Mark): PlacementGeometry | null => {
+    let geometry = geometryMap.get(mark.id);
+    if (!geometry) {
+      geometry = computeGeometry(mark);
+      if (geometry) {
+        geometryMap.set(mark.id, geometry);
+      }
+    }
+    return geometry;
+  };
+
+  const buildPaddingText = (geometry: PlacementGeometry): string => {
+    const topPadding = Math.max(0, Math.round(geometry.topPx));
+    const bottomPadding = Math.max(0, Math.round(canvasHeight - geometry.bottomPx));
+    const leftPadding = Math.max(0, Math.round(geometry.leftPx));
+    const rightPadding = Math.max(0, Math.round(canvasWidth - geometry.rightPx));
+
+    const verticalParts: string[] = [];
+    if (topPadding > 0) verticalParts.push(`${topPadding}px above`);
+    if (bottomPadding > 0) verticalParts.push(`${bottomPadding}px below`);
+
+    const horizontalParts: string[] = [];
+    if (leftPadding > 0) horizontalParts.push(`${leftPadding}px on the left`);
+    if (rightPadding > 0) horizontalParts.push(`${rightPadding}px on the right`);
+
+    if (verticalParts.length === 0 && horizontalParts.length === 0) {
+      return '';
+    }
+
+    const segments: string[] = [];
+    if (verticalParts.length > 0) segments.push(verticalParts.join(' and '));
+    if (horizontalParts.length > 0) segments.push(horizontalParts.join(' and '));
+
+    return `This leaves about ${segments.join(', ')} of breathing room relative to the canvas edges.`;
+  };
+
+  const buildContextHints = (mark: Mark, geometry: PlacementGeometry): string => {
+    if (!hasCanvasDimensions) {
+      return '';
+    }
+
+    const candidates = contextMarksForHints
+      .filter(ctxMark => ctxMark.id !== mark.id)
+      .map(ctxMark => {
+        const ctxGeometry = getGeometryFor(ctxMark);
+        return ctxGeometry ? { mark: ctxMark, geometry: ctxGeometry } : null;
+      })
+      .filter((entry): entry is { mark: Mark; geometry: PlacementGeometry } => entry !== null);
+
+    if (candidates.length === 0) {
+      return '';
+    }
+
+    const hints: string[] = [];
+
+    const aboveCandidate = candidates
+      .filter(entry => entry.geometry.centerYpx < geometry.centerYpx)
+      .sort((a, b) => b.geometry.centerYpx - a.geometry.centerYpx)[0];
+    if (aboveCandidate) {
+      hints.push(`It should sit below the ${readableLabel(aboveCandidate.mark)} region.`);
+    }
+
+    const belowCandidate = candidates
+      .filter(entry => entry.geometry.centerYpx > geometry.centerYpx)
+      .sort((a, b) => a.geometry.centerYpx - b.geometry.centerYpx)[0];
+    if (belowCandidate) {
+      hints.push(`Keep it above the ${readableLabel(belowCandidate.mark)} region.`);
+    }
+
+    const leftCandidate = candidates
+      .filter(entry => entry.geometry.centerXpx < geometry.centerXpx)
+      .sort((a, b) => b.geometry.centerXpx - a.geometry.centerXpx)[0];
+    if (leftCandidate) {
+      const delta = Math.round(geometry.leftPx - leftCandidate.geometry.leftPx);
+      const label = readableLabel(leftCandidate.mark);
+      if (Math.abs(delta) <= alignmentTolerancePx) {
+        hints.push(`Align its left edge with the ${label} region.`);
+      } else if (delta > 0) {
+        hints.push(`Keep its left edge about ${delta}px to the right of the ${label} region's left edge.`);
+      } else {
+        hints.push(`Let it extend about ${Math.abs(delta)}px to the left of the ${label} region's left edge.`);
+      }
+    }
+
+    const rightCandidate = candidates
+      .filter(entry => entry.geometry.centerXpx > geometry.centerXpx)
+      .sort((a, b) => a.geometry.centerXpx - b.geometry.centerXpx)[0];
+    if (rightCandidate) {
+      const delta = Math.round(rightCandidate.geometry.rightPx - geometry.rightPx);
+      const label = readableLabel(rightCandidate.mark);
+      if (Math.abs(delta) <= alignmentTolerancePx) {
+        hints.push(`Align its right edge with the ${label} region.`);
+      } else if (delta > 0) {
+        hints.push(`Keep its right edge about ${delta}px to the left of the ${label} region's right edge.`);
+      } else {
+        hints.push(`Let its right edge extend about ${Math.abs(delta)}px beyond the ${label} region's right edge while staying inside the hotspot area.`);
+      }
+    }
+
+    const centerAlignedCandidate = candidates.find(entry => Math.abs(entry.geometry.centerXpx - geometry.centerXpx) <= alignmentTolerancePx);
+    if (centerAlignedCandidate) {
+      const label = readableLabel(centerAlignedCandidate.mark);
+      const centerHint = `Center it horizontally with the ${label} region.`;
+      if (!hints.includes(centerHint)) {
+        hints.push(centerHint);
+      }
+    }
+
+    return hints.slice(0, 4).join(' ');
+  };
+
+  const fallbackPlacementText = 'Keep the element inside the original canvas bounds and size proportionally to match surrounding design. Treat the requested location as an invisible hotspot used only for planning—its edges must never show in the final art, even if multiple hotspots are addressed at once. Absolutely no outlines, strokes, halos, drop shadows, or borders may appear in the final output.';
+
+  const describePlacementArea = (mark: Mark) => {
+    if (!hasCanvasDimensions) {
+      return fallbackPlacementText;
+    }
+
+    const geometry = getGeometryFor(mark);
+    if (!geometry) {
+      const centerX = clampNormalized(mark.x).toFixed(2);
+      const centerY = clampNormalized(mark.y).toFixed(2);
+      return `${fallbackPlacementText} The hotspot is centered roughly at normalized coordinates (${centerX}, ${centerY}).`;
+    }
+
+    const widthPercent = Math.round(geometry.widthNorm * 100);
+    const heightPercent = Math.round(geometry.heightNorm * 100);
+    const baseText = `Keep the element inside the ${geometry.widthPx}px × ${geometry.heightPx}px placement zone centered at (${geometry.centerXpx}px, ${geometry.centerYpx}px) on the ${canvasWidth}×${canvasHeight}px canvas (normalized center ≈ (${geometry.centerXNorm.toFixed(3)}, ${geometry.centerYNorm.toFixed(3)})).`;
+    const extentText = `This invisible area spans roughly from (${geometry.leftPx}px, ${geometry.topPx}px) to (${geometry.rightPx}px, ${geometry.bottomPx}px), covering about ${widthPercent}% of the canvas width and ${heightPercent}% of its height. Normalized bounds ≈ (${geometry.leftNorm.toFixed(3)}, ${geometry.topNorm.toFixed(3)}) to (${geometry.rightNorm.toFixed(3)}, ${geometry.bottomNorm.toFixed(3)}).`;
+    const paddingText = buildPaddingText(geometry);
+    const contextHints = buildContextHints(mark, geometry);
+
+    return `${baseText} ${extentText}${paddingText ? ` ${paddingText}` : ''}${contextHints ? ` ${contextHints}` : ''} Treat this area as a purely imaginary placement zone—keep every pixel inside it, but leave no visible trace that the guide ever existed, even when several hotspots are filled at once.`;
+  };
+
+  const noBorderClause = 'Never introduce or retain any outline, stroke, drop shadow, glow, halo, or border around the element or its bounding box. The hotspot rectangle is only a planning guide—do not render, trace, or hint at it. If any border or placeholder appears during drafting, remove it completely so the element melts seamlessly into the surrounding background, even when multiple hotspots are being filled at once.';
 
   promptParts.push({
     inlineData: {
@@ -122,7 +331,7 @@ export const generateCreative = async (
             }
           } else {
             // New logic for adding text
-            editInstructions.push(`- Add a brand-new text element for '${mark.label}' inside the designated hotspot. This MUST create additional copy without replacing or hiding any existing text elsewhere in the creative. Insert exactly: "${newText}". Critical instructions: Place this text ON TOP of the existing template canvas. ${describePlacementArea(mark)} Keep the text horizontally and vertically centered inside that region. The baseline should sit midway between the top and bottom edges of the rectangle. ${noBorderClause} It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new text. The text's style, font, kerning, leading, and color should match the overall aesthetic of the template.`);
+            editInstructions.push(`- Add a brand-new text element for '${mark.label}' inside the designated hotspot. This MUST create additional copy without replacing or hiding any existing text elsewhere in the creative. Insert exactly: "${newText}". Critical instructions: Place this text ON TOP of the existing template canvas. ${describePlacementArea(mark)} Keep the text horizontally and vertically centered within that invisible guide. The baseline should sit midway between the top and bottom edges of the imagined zone. ${noBorderClause} Do NOT place the copy inside a capsule, label, speech bubble, or box unless the original template already used one in that location. It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new text. The text's style, font, kerning, leading, and color should match the overall aesthetic of the template.`);
             newTextHotspots.push(newText);
           }
       }
@@ -130,19 +339,25 @@ export const generateCreative = async (
        const mode = imageModes[mark.id] || 'upload';
        const asset = imageAssets[mark.id];
        const description = (imagePrompts[mark.id] || '').trim();
-       const sizeInstruction = mark.scale ? `It should occupy about ${Math.round(mark.scale * 100)}% of the image's width.` : `Its size should be appropriate for its context (e.g., a small logo).`;
+       const widthPercent = mark.width ? Math.max(1, Math.round((mark.width || 0) * 100)) : null;
+       const heightPercent = mark.height ? Math.max(1, Math.round((mark.height || 0) * 100)) : null;
+       const sizeInstruction = (widthPercent && heightPercent)
+         ? `Scale it so it naturally fills roughly ${widthPercent}% of the canvas width and ${heightPercent}% of the canvas height while staying inside the invisible hotspot—never indicate that boundary with frames, rules, or glow.`
+         : mark.scale
+           ? `Aim for it to cover about ${Math.round(mark.scale * 100)}% of the image's width while blending into the composition without framing it.`
+           : `Size it appropriately for the scene (for example, a small logo) but keep it frameless and integrated.`;
        if (mode === 'upload' && asset) {
          if (isExistingMark) {
            editInstructions.push(`- Replace the image labeled '${mark.label}' with the user's new provided '${mark.label}' image. The new image's lighting, shadows, perspective, and reflections MUST perfectly match the surrounding scene.`);
          } else {
-            editInstructions.push(`- Add a brand-new image element for '${mark.label}' inside the described hotspot. This MUST be additional artwork layered on top of the existing design; do not remove or overwrite surrounding imagery. Critical instructions: Place this image ON TOP of the existing template canvas. ${describePlacementArea(mark)} ${sizeInstruction} ${noBorderClause} Snap the image so its edges align with the rectangle while staying fully inside it (use subtle feathering instead of hard outlines). It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new image. The new image must be placed ENTIRELY within the original boundaries. Adjust the new image's lighting, shadows, and perspective to perfectly match the surrounding scene.`);
+            editInstructions.push(`- Add a brand-new image element for '${mark.label}' inside the described hotspot. This MUST be additional artwork layered on top of the existing design; do not remove or overwrite surrounding imagery. Critical instructions: Place this image ON TOP of the existing template canvas. ${describePlacementArea(mark)} ${sizeInstruction} ${noBorderClause} Ensure the image fits entirely within the invisible hotspot while appearing natural—never draw borders, trays, stickers, Polaroid frames, or placeholders around it. It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new image. The new image must be placed ENTIRELY within the original boundaries. Adjust the new image's lighting, shadows, and perspective to perfectly match the surrounding scene.`);
             newImageHotspots.push(mark.label);
          }
        } else if (mode === 'describe' && description) {
          if (isExistingMark) {
             editInstructions.push(`- Replace the image labeled '${mark.label}' with a new image that matches this description: ${description}. Ensure lighting, shadows, and perspective align perfectly with the existing design.`);
          } else {
-            editInstructions.push(`- Add a brand-new image element for '${mark.label}' based on this description: ${description}. This must be additional artwork that coexists with the original design—do not delete or repaint existing elements. Place it ON TOP of the existing template canvas. ${describePlacementArea(mark)} ${sizeInstruction} ${noBorderClause} Snap the image so its edges align with the rectangle while staying fully inside it. Do not alter the template dimensions; keep the new element entirely within the original boundaries and match the surrounding lighting and perspective.`);
+            editInstructions.push(`- Add a brand-new image element for '${mark.label}' based on this description: ${description}. This must be additional artwork that coexists with the original design—do not delete or repaint existing elements. Place it ON TOP of the existing template canvas. ${describePlacementArea(mark)} ${sizeInstruction} ${noBorderClause} Ensure the image fits squarely inside the invisible hotspot while blending seamlessly—never draw borders, mats, stickers, or placeholder boxes. Do not alter the template dimensions; keep the new element entirely within the original boundaries and match the surrounding lighting and perspective.`);
             newImageHotspots.push(mark.label);
          }
        }
@@ -156,13 +371,13 @@ export const generateCreative = async (
 
   const hasNewHotspots = newTextHotspots.length > 0 || newImageHotspots.length > 0;
   const newHotspotDirective = hasNewHotspots
-    ? `    5.  **NEW HOTSPOT CONTENT:** When instructions say "add" or reference a new hotspot, treat that rectangle as an empty layer that needs fresh content. Keep all existing text, logos, and imagery untouched. Generate only the new element within the specified bounds—never rewrite, remove, or restyle other parts of the creative.`
+    ? `    5.  **NEW HOTSPOT CONTENT:** When instructions say "add" or reference a new hotspot, treat that hotspot area as an empty, invisible layer that needs fresh content. Keep all existing text, logos, and imagery untouched. Generate only the new element within the specified bounds—never rewrite, remove, or restyle other parts of the creative. Hotspot guides are invisible; never display their outlines, boxes, or alignment aids in the finished render, even when multiple hotspots are added together. Fulfil each hotspot independently—do not group them into a shared card, banner, or container.`
     : '';
 
   const fewShotBase = hasNewHotspots
     ? [
-        "User input: 'Add new text: Happy Holidays'. Expected Output: 'Happy Holidays'.",
-        "User input: 'Add new text: 20% Off'. Expected Output: '20% Off'."
+        "User input: 'Add new text: Happy Holidays'. Expected Output: 'Happy Holidays' inserted directly into the hotspot with no box, label, or outline.",
+        "User input: 'Add new image: fresh orange juice'. Expected Output: 'fresh orange juice' seamlessly placed inside the hotspot with zero frames, stickers, or borders."
       ]
     : [];
 
@@ -185,7 +400,7 @@ export const generateCreative = async (
     1.  **DO NOT RECREATE:** You are only modifying small, specified parts of the template. The rest of the image MUST remain identical to the original.
     2.  **ABSOLUTE DIMENSION LOCK:** It is absolutely forbidden to alter the original template's dimensions or aspect ratio unless an explicit 'Aspect Ratio Requirement' is given below. Do NOT expand, crop, or change the canvas size to fit new elements. New elements are always placed ON TOP of the existing canvas, within its original boundaries. This is the most important rule.
     3.  **SEAMLESS INTEGRATION:** All new or replaced elements (text and images) must be perfectly integrated. Match the original template's lighting, perspective, style, and quality.
-    4.  **BOUNDING BOX COMPLIANCE:** When a rectangle or placement region is described, treat it as an exact clipping mask. The new element must stay fully inside its edges with no drift. If the request mentions centering, keep the element centered in both axes within that region. Never add borders, strokes, halos, or shadows around the region.
+    4.  **BOUNDING BOX COMPLIANCE:** When a placement region is described, treat it as an invisible clipping mask. The new element must stay fully inside its bounds with no drift. If the request mentions centering, keep the element centered in both axes within that region. Never add borders, strokes, halos, stickers, or shadows around the region—and when multiple hotspots are generated together, keep each element frameless with no shared panels or outlines. Remove any placeholder guides before delivering the final image.
 ${newHotspotDirective ? `\n${newHotspotDirective}` : ''}
 
     **Task Description from Original Brief:** ${basePrompt}

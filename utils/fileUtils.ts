@@ -74,7 +74,7 @@ export const downloadImage = (imageUrl: string, fileName: string, watermarkText?
 };
 
 
-export const imageUrlToBase64 = async (url: string): Promise<{ base64: string; mimeType: string }> => {
+export const imageUrlToBase64 = async (url: string): Promise<{ base64: string; mimeType: string; width: number; height: number }> => {
   // This is a robust function to convert any image URL (blob, data, https) to base64.
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -85,13 +85,15 @@ export const imageUrlToBase64 = async (url: string): Promise<{ base64: string; m
     }
 
     img.onload = () => {
+      const width = img.width;
+      const height = img.height;
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
       if (!ctx) {
         return reject(new Error("Failed to get canvas context."));
       }
-      canvas.width = img.width;
-      canvas.height = img.height;
+      canvas.width = width;
+      canvas.height = height;
       ctx.drawImage(img, 0, 0);
 
       // Determine MIME type. Default to png.
@@ -106,7 +108,7 @@ export const imageUrlToBase64 = async (url: string): Promise<{ base64: string; m
       const dataUrl = canvas.toDataURL(mimeType);
       const base64 = dataUrl.split(',')[1];
       
-      resolve({ base64, mimeType });
+      resolve({ base64, mimeType, width, height });
     };
 
     img.onerror = (errorEvent) => {
