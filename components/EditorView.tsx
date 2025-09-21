@@ -334,7 +334,9 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     });
   }, []);
 
-  const activeImageUrl = history[activeIndex]?.imageUrl || templateImageUrl;
+  const activeImage = history[activeIndex];
+  const activeImageUrl = activeImage?.imageUrl || templateImageUrl;
+  const canDownloadActiveImage = activeIndex > 0 && !!activeImage;
   const activeMark = useMemo(() => {
     if (!activeHotspotId) return null;
     return marks.find(m => m.id === activeHotspotId) || null;
@@ -826,7 +828,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   };
   
   const handleDownload = () => {
-    const activeImage = history[activeIndex];
+    if (!canDownloadActiveImage || !activeImage) return;
     const watermark = isProUser ? undefined : 'Made with getmycreative';
     downloadImage(activeImage.imageUrl, `creative-${activeImage.id}.png`, watermark);
   };
@@ -956,6 +958,9 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     const labelPending = isHotspotLabelPending(activeMark);
     const includeReady = canEnableMark(markId);
 
+    const normalizedLabel = (activeMark.label ?? '').toLowerCase();
+    const textRows = normalizedLabel.includes('body') ? 4 : 2;
+
     const handleClose = () => setActiveHotspotId(null);
     const handleLabelChange = (value: string) => {
         updateMarkLabel(markId, value);
@@ -1081,7 +1086,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                                     setTextFields(prev => ({ ...prev, [markId]: nextValue }));
                                     applyMarkEnabledFromContent(markId, { text: nextValue });
                                 }}
-                                rows={activeMark.label.toLowerCase().includes('body') ? 4 : 2}
+                                rows={textRows}
                                 placeholder="Enter the text you want to appear in this spot"
                                 className="w-full rounded-xl border border-slate-300 py-3 px-4 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                             />
@@ -1476,7 +1481,12 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                 <div className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-2xl bg-black/60 opacity-0 transition-opacity group-hover:opacity-100">
                   <button
                     onClick={handleDownload}
-                    className="pointer-events-auto flex items-center gap-2 rounded-full bg-white px-4 py-2 text-sm font-semibold text-black"
+                    disabled={!canDownloadActiveImage}
+                    className={`pointer-events-auto flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold transition ${
+                      canDownloadActiveImage
+                        ? 'bg-white text-black hover:bg-white/90'
+                        : 'cursor-not-allowed bg-white/70 text-gray-500'
+                    }`}
                   >
                     <DownloadIcon className="h-4 w-4" /> Download
                   </button>
@@ -1484,7 +1494,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
               )}
               {imageBounds.width > 0 && imageBounds.height > 0 && (
                 <div
-                  className="absolute pointer-events-none"
+                  className={`absolute ${showHotspotOverlay || isPlacingMark ? '' : 'pointer-events-none'}`}
                   style={{
                     left: imageBounds.left,
                     top: imageBounds.top,
