@@ -249,7 +249,6 @@ export interface EditToggles {
 
 export interface ChatEditOptions {
     brandColors?: string[];
-    newAspectRatio?: string;
     mentions?: string[];
 }
 
@@ -286,7 +285,6 @@ export const generateCreative = async (
   imagePrompts: Record<string, string>,
   imageModes: Record<string, 'upload' | 'describe'>,
   enabledMarks: Record<string, boolean>,
-  aspectRatio: string,
   marks: Mark[],
   initialMarks: Mark[],
   options: {
@@ -614,11 +612,7 @@ export const generateCreative = async (
        }
     }
   });
-
-
-  const aspectRatioInstruction = aspectRatio === 'original'
-    ? "The output image's aspect ratio and dimensions MUST EXACTLY match the original template's."
-    : `The output image MUST have a final aspect ratio of ${aspectRatio}. Adapt the template's layout to fit this new aspect ratio gracefully.`;
+  const aspectRatioInstruction = "The output image's aspect ratio and dimensions MUST EXACTLY match the original template's.";
 
   const hasNewHotspots = newTextHotspots.length > 0 || newImageHotspots.length > 0 || overlayNewTextHotspots.length > 0;
   const newHotspotDirective = hasNewHotspots
@@ -663,7 +657,7 @@ ${newHotspotDirective ? `\n${newHotspotDirective}` : ''}${overlayReminder}
     **Aspect Ratio Requirement**: ${aspectRatioInstruction}
 
     **SPECIFIC EDITING TASKS:**
-    ${editInstructions.length > 0 ? editInstructions.join('\n') : "No specific edits requested. Generate the creative based on the original brief and aspect ratio."}
+    ${editInstructions.length > 0 ? editInstructions.join('\n') : "No specific edits requested. Generate the creative based on the original brief while keeping the original canvas dimensions."}
     ${fewShotGuidance}
     ---
   `;
@@ -716,10 +710,6 @@ export const editCreativeWithChat = async (
 
   if (editOptions.brandColors && editOptions.brandColors.length > 0) {
     instructionPrompt += `\n- **Color Palette Constraint:** The final image must strictly adhere to this color palette: ${editOptions.brandColors.join(', ')}. Use these colors intelligently to theme the creative. The primary color is ${editOptions.brandColors[0]}.`;
-  }
-
-  if (editOptions.newAspectRatio && editOptions.newAspectRatio !== 'original') {
-     instructionPrompt += `\n- **Aspect Ratio Requirement:** The output image MUST have a final aspect ratio of ${editOptions.newAspectRatio}. Adapt the image's layout to fit this new aspect ratio gracefully, preserving the key elements.`;
   }
 
   if (editOptions.mentions && editOptions.mentions.length > 0) {

@@ -485,7 +485,6 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const [chatAttachment, setChatAttachment] = useState<BrandAsset | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [brandColors, setBrandColors] = useState<string[]>(appUser?.brandColors ?? []);
-  const [aspectRatio, setAspectRatio] = useState('original');
   const projectStyleSnapshot = (project && (project as unknown as { styleSnapshot?: TemplateStyleSnapshot }).styleSnapshot) ?? null;
   const [styleSnapshot, setStyleSnapshot] = useState<TemplateStyleSnapshot | null>(projectStyleSnapshot ?? pendingTemplate?.styleSnapshot ?? null);
   const [generatedAssets, setGeneratedAssets] = useState<Record<string, HotspotAssetPlacement>>({});
@@ -1318,23 +1317,14 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
       const existingMarks = readyMarks.filter(mark => !mark.isNew);
 
       const overlayTextMarks = readyMarks.filter(mark => {
-        if (mark.type !== 'text') {
+        if (mark.type !== 'text' || !mark.isNew) {
           return false;
         }
         const nextText = (textFields[mark.id] ?? '').trim();
-        if (!nextText) {
-          return false;
-        }
-        if (mark.isNew) {
-          return true;
-        }
-        const originalTrimmed = (originalMarksMap[mark.id]?.text ?? '').trim();
-        return !originalTrimmed || originalTrimmed !== nextText;
+        return nextText.length > 0;
       });
       const overlayTextMarkIdSet = new Set(overlayTextMarks.map(mark => mark.id));
-      const existingOverlayTextMarkIds = overlayTextMarks
-        .filter(mark => !mark.isNew)
-        .map(mark => mark.id);
+      const existingOverlayTextMarkIds: string[] = [];
 
       const updates: string[] = [];
       let latestBaseImageUrl = templateImageUrl;
@@ -1355,7 +1345,6 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
           imagePrompts,
           imageModes,
           enabledForGeneration,
-          aspectRatio,
           marks,
           originalMarks,
           {
@@ -1577,7 +1566,6 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     imageAssets,
     imagePrompts,
     imageModes,
-    aspectRatio,
     marks,
     originalMarks,
     originalMarksMap,
@@ -1737,7 +1725,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         const { base64: baseImageBase64, mimeType: baseImageMimeType } = await imageUrlToBase64(activeImage.imageUrl);
         const referenceImage = chatAttachment ? { base64: chatAttachment.base64, mimeType: chatAttachment.file.type } : undefined;
         
-        const editOptions: ChatEditOptions = { brandColors, newAspectRatio: aspectRatio, mentions: valid };
+        const editOptions: ChatEditOptions = { brandColors, mentions: valid };
 
         const editedImageBase64 = await editCreativeWithChat(
             baseImageBase64, baseImageMimeType, userMessage.text!, referenceImage, editOptions
@@ -2785,25 +2773,6 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
               </button>
             )}
           </div>
-        </div>
-      </div>
-
-      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-        <p className="text-sm font-semibold text-gray-800">Aspect ratio</p>
-        <p className="mt-1 text-xs text-gray-500">Pick the format for your next render.</p>
-        <div className="mt-3 flex flex-wrap gap-2">
-          {['original', '1:1', '16:9', '9:16'].map(option => (
-            <button
-              key={option}
-              type="button"
-              onClick={() => setAspectRatio(option)}
-              className={`min-w-[80px] rounded-lg px-4 py-2 text-sm font-semibold transition-colors whitespace-nowrap text-center ${
-                aspectRatio === option ? 'border border-emerald-500 bg-emerald-100 text-emerald-700 shadow-sm' : 'border border-slate-200 bg-slate-50 text-gray-600 hover:bg-white'
-              }`}
-            >
-              {option === 'original' ? 'Original' : option}
-            </button>
-          ))}
         </div>
       </div>
 
