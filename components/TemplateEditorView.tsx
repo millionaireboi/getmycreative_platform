@@ -286,7 +286,8 @@ export const TemplateEditorView = ({ template, onBack }: { template: UITemplate,
                 x: currentDrawing.x + currentDrawing.width / 2,
                 y: currentDrawing.y + currentDrawing.height / 2,
                 width: currentDrawing.width,
-                height: currentDrawing.height
+                height: currentDrawing.height,
+                category: 'content'
             };
             setMarks(prev => [...prev, newMark]);
         }

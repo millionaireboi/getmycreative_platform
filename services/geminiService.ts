@@ -2,7 +2,7 @@
 
 
 import { GoogleGenAI, Modality, Type } from "@google/genai";
-import { BrandAsset, Mark, TemplateStyleSnapshot, TemplateTypographyStyle, TypographyRole } from '../core/types/shared.ts';
+import { BrandAsset, Mark, MarkCategory, TemplateStyleSnapshot, TemplateTypographyStyle, TypographyRole } from '../core/types/shared.ts';
 import { ALL_TAGS } from "../constants.ts";
 
 type PlacementGeometry = {
@@ -28,6 +28,7 @@ type PlacementGeometry = {
 const API_KEY = (import.meta as any).env?.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
 
 const ALLOWED_TYPOGRAPHY_ROLES: TypographyRole[] = ['headline', 'subheading', 'body', 'caption', 'accent', 'decorative'];
+const ALLOWED_MARK_CATEGORIES: MarkCategory[] = ['content', 'decorative', 'silhouette', 'background'];
 
 const normalizeHex = (value: string): string | null => {
   const trimmed = value.trim();
@@ -87,6 +88,119 @@ const sanitizeMotifs = (input: unknown): string[] => {
     .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
     .map(entry => entry.trim())
     .slice(0, 12);
+};
+
+const inferTypographyRoleFromLabel = (label: unknown): TypographyRole | undefined => {
+  if (typeof label !== 'string' || !label) {
+    return undefined;
+  }
+  const normalized = label.toLowerCase();
+  if (normalized.includes('headline') || normalized.includes('title') || normalized.includes('main heading')) {
+    return 'headline';
+  }
+  if (normalized.includes('subhead') || normalized.includes('sub-head') || normalized.includes('subtitle') || normalized.includes('subheading')) {
+    return 'subheading';
+  }
+  if (normalized.includes('body') || normalized.includes('paragraph') || normalized.includes('copy') || normalized.includes('description') || normalized.includes('details')) {
+    return 'body';
+  }
+  if (normalized.includes('caption') || normalized.includes('footnote') || normalized.includes('legal') || normalized.includes('disclaimer') || normalized.includes('small print')) {
+    return 'caption';
+  }
+  if (normalized.includes('tagline') || normalized.includes('cta') || normalized.includes('call to action') || normalized.includes('button') || normalized.includes('price')) {
+    return 'accent';
+  }
+  if (normalized.includes('decorative') || normalized.includes('ornament') || normalized.includes('flourish')) {
+    return 'decorative';
+  }
+  return undefined;
+};
+
+const classifyCategoryFromString = (raw: string): MarkCategory | undefined => {
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+  if (ALLOWED_MARK_CATEGORIES.includes(normalized as MarkCategory)) {
+    return normalized as MarkCategory;
+  }
+  if (
+    normalized.includes('silhou') ||
+    normalized.includes('cutout') ||
+    normalized.includes('cut-out') ||
+    normalized.includes('stencil') ||
+    normalized.includes('outline')
+  ) {
+    return 'silhouette';
+  }
+  if (
+    normalized.includes('background') ||
+    normalized.includes('backdrop') ||
+    normalized.includes('wallpaper') ||
+    normalized.includes('canvas fill') ||
+    normalized.includes('texture layer')
+  ) {
+    return 'background';
+  }
+  if (
+    normalized.includes('decor') ||
+    normalized.includes('ornament') ||
+    normalized.includes('flourish') ||
+    normalized.includes('motif') ||
+    normalized.includes('pattern') ||
+    normalized.includes('accent') ||
+    normalized.includes('frame') ||
+    normalized.includes('border') ||
+    normalized.includes('icon') ||
+    normalized.includes('sticker') ||
+    normalized.includes('shape')
+  ) {
+    return 'decorative';
+  }
+  if (
+    normalized.includes('product') ||
+    normalized.includes('primary') ||
+    normalized.includes('hero') ||
+    normalized.includes('content') ||
+    normalized.includes('focus') ||
+    normalized.includes('photo') ||
+    normalized.includes('image')
+  ) {
+    return 'content';
+  }
+  return undefined;
+};
+
+const sanitizeMarkCategory = (candidate: unknown, label: unknown, type: unknown): MarkCategory => {
+  if (typeof candidate === 'string') {
+    const normalized = classifyCategoryFromString(candidate);
+    if (normalized) {
+      return type === 'text' && normalized !== 'content' ? 'content' : normalized;
+    }
+  }
+
+  if (typeof label === 'string') {
+    const inferredFromLabel = classifyCategoryFromString(label);
+    if (inferredFromLabel) {
+      if (type === 'text') {
+        return 'content';
+      }
+      return inferredFromLabel;
+    }
+  }
+
+  if (typeof candidate === 'string') {
+    const looseNormalized = candidate.trim().toLowerCase();
+    if (looseNormalized === 'bg') {
+      return 'background';
+    }
+  }
+
+  if (type === 'text') {
+    return 'content';
+  }
+
+  return 'content';
 };
 
 const pngHasAlphaChannel = (base64: string): boolean => {
@@ -149,8 +263,11 @@ export interface HotspotAssetRequest {
   placementSummary?: string;
   aspectRatioHint?: string;
   sizeHint?: { widthPx?: number; heightPx?: number; aspectRatio?: string };
+  typographyStyle?: TemplateTypographyStyle;
+  typographyRoleHint?: TypographyRole;
   hotspotCrop?: { base64: string; mimeType: string };
   templateThumbnail?: { base64: string; mimeType: string };
+  lineBreakPreference?: 'auto' | 'single-line' | 'multi-line';
 }
 
 export interface HotspotAssetResult {
@@ -652,16 +769,17 @@ export const editCreativeWithChat = async (
 export const detectEditableRegions = async (imageBase64: string, mimeType: string): Promise<Mark[]> => {
     const ai = getAi();
     const prompt = `
-        Analyze the provided creative template. Your task is to identify ALL distinct editable regions and extract their content. This includes logos, product images, headlines, body text, and other fields.
+        Analyze the provided creative template. Your task is to identify ALL distinct editable regions and extract their content. This includes logos, product visuals, headlines, body text, background plates, decorative flourishes, silhouettes, stickers, icons, and any other accents a designer might want to swap or recolor.
         
         For each region, you must provide:
         1.  A machine-friendly 'id' in camelCase (e.g., 'mainHeadline', 'contactEmail', 'logo'). The ID for the main brand logo should always be 'logo'.
         2.  A human-friendly 'label' (e.g., 'Main Headline', 'Contact Email', 'Logo').
-        3.  The 'type' of the region, which MUST be either "text" or "image".
-        4.  For regions of type "text", you MUST perform OCR and return the exact 'text' content you see. This field should be omitted for image regions.
-        5.  The normalized center point coordinates (x, y) and dimensions (width, height), all between 0 and 1, where (0,0) is top-left.
-        
-        Only identify elements that are clearly intended to be replaced by a user. Be precise with the bounding boxes and text extraction.
+        3.  The 'type' of the region, which MUST be either "text" or "image". Decorative, silhouette, or background elements should still be typed as "image".
+        4.  The 'category' describing the region's visual intent. Use exactly one of: "content" (primary brand/product/message elements), "decorative" (ornamental accents, frames, motifs, icons, stickers), "silhouette" (cut-outs, stencils, contour overlays), or "background" (replaceable backdrops or canvases). Always include this field.
+        5.  For regions of type "text", you MUST perform OCR and return the exact 'text' content you see. This field should be omitted for image regions.
+        6.  The normalized center point coordinates (x, y) and dimensions (width, height), all between 0 and 1, where (0,0) is top-left.
+
+        Treat stacked or layered accents as distinct regions if they can be edited independently. Do not omit subtle decorative, silhouette, or background assets if they are visually significant in the composition.
     `;
 
     const result = await ai.models.generateContent({
@@ -685,13 +803,14 @@ export const detectEditableRegions = async (imageBase64: string, mimeType: strin
                                 id: { type: Type.STRING, description: "Unique ID in camelCase (e.g., mainHeadline). Use 'logo' for the primary brand logo." },
                                 label: { type: Type.STRING, description: 'Human-friendly label (e.g., Main Headline).' },
                                 type: { type: Type.STRING, description: 'Must be "text" or "image".' },
+                                category: { type: Type.STRING, description: 'One of "content", "decorative", "silhouette", or "background" describing the visual intent.' },
                                 text: { type: Type.STRING, description: "The OCR-extracted text content. Only for type 'text'." },
                                 x: { type: Type.NUMBER, description: 'Normalized center X coordinate (0-1).' },
                                 y: { type: Type.NUMBER, description: 'Normalized center Y coordinate (0-1).' },
                                 width: { type: Type.NUMBER, description: 'Normalized width (0-1).' },
                                 height: { type: Type.NUMBER, description: 'Normalized height (0-1).' },
                             },
-                            propertyOrdering: ["id", "label", "type", "text", "x", "y", "width", "height"],
+                            propertyOrdering: ["id", "label", "type", "category", "text", "x", "y", "width", "height"],
                         }
                     }
                 },
@@ -715,15 +834,38 @@ export const detectEditableRegions = async (imageBase64: string, mimeType: strin
 
     if (parsed && parsed.regions && Array.isArray(parsed.regions)) {
         // The AI might return invalid data, so we filter to be safe
-        return parsed.regions.filter((r: any) => 
-            typeof r.id === 'string' &&
-            typeof r.label === 'string' &&
-            (r.type === 'text' || r.type === 'image') &&
-            typeof r.x === 'number' &&
-            typeof r.y === 'number' &&
-            typeof r.width === 'number' &&
-            typeof r.height === 'number'
-        );
+        return parsed.regions
+            .filter((r: any) =>
+                typeof r.id === 'string' &&
+                typeof r.label === 'string' &&
+                (r.type === 'text' || r.type === 'image') &&
+                typeof r.x === 'number' &&
+                typeof r.y === 'number' &&
+                typeof r.width === 'number' &&
+                typeof r.height === 'number'
+            )
+            .map((region: any) => {
+                const category = sanitizeMarkCategory(region.category, region.label, region.type);
+                const mark: Mark = {
+                    id: region.id,
+                    label: region.label,
+                    type: region.type,
+                    x: region.x,
+                    y: region.y,
+                    width: region.width,
+                    height: region.height,
+                    category,
+                    ...(region.scale ? { scale: region.scale } : {}),
+                    ...(region.text ? { text: region.text } : {}),
+                };
+                if (mark.type === 'text') {
+                    const inferred = inferTypographyRoleFromLabel(mark.label);
+                    if (inferred) {
+                        mark.typographyRole = inferred;
+                    }
+                }
+                return mark;
+            });
     }
     return [];
 };
@@ -985,6 +1127,23 @@ export const generateHotspotAsset = async (request: HotspotAssetRequest): Promis
   const typographyBullets = styleSnapshot.typography
     .map(typo => `- ${typo.role.toUpperCase()}: ${typo.description}${typo.primaryColor ? ` (color ${typo.primaryColor})` : ''}`)
     .join('\n');
+  const targetedTypographyLine = (() => {
+    const style = request.typographyStyle;
+    if (style) {
+      const fragments: string[] = [style.description];
+      if (style.casing) {
+        fragments.push(`set in ${style.casing} case`);
+      }
+      if (style.primaryColor) {
+        fragments.push(`typically ${style.primaryColor}`);
+      }
+      return `- Primary typography target: ${style.role.toUpperCase()} — ${fragments.join(', ')}.`;
+    }
+    if (request.typographyRoleHint) {
+      return `- If multiple styles exist, bias toward a convincing ${request.typographyRoleHint.toUpperCase()} treatment.`;
+    }
+    return '';
+  })();
   const motifText = styleSnapshot.motifKeywords.join(', ');
   const motifBullet = motifText
     ? intent === 'text'
@@ -994,7 +1153,8 @@ export const generateHotspotAsset = async (request: HotspotAssetRequest): Promis
   const textOnlyBullets = intent === 'text'
     ? `- Output must consist solely of the rendered letterforms; keep all other pixels fully transparent.
 - Do not generate plates, ribbons, flourishes, gradients, or shadows that depend on an added background.
-- Maintain clean negative space around the text without inventing extra copy.`
+- Maintain clean negative space around the text without inventing extra copy.
+- Keep each word intact; never split a single word across multiple lines or add hyphenation.`
     : '';
 
   const roleDirective = intent === 'text'
@@ -1018,6 +1178,55 @@ export const generateHotspotAsset = async (request: HotspotAssetRequest): Promis
   const lightingDirective = styleSnapshot.lightingSummary ? `Lighting guidance: ${styleSnapshot.lightingSummary}.` : '';
   const notesDirective = styleSnapshot.additionalNotes ? `Additional guardrails: ${styleSnapshot.additionalNotes}.` : '';
 
+  const normalizedAspectRatio = (() => {
+    if (request.sizeHint?.aspectRatio) {
+      const parsed = Number.parseFloat(request.sizeHint.aspectRatio);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+    const width = request.sizeHint?.widthPx ?? 0;
+    const height = request.sizeHint?.heightPx ?? 0;
+    if (width > 0 && height > 0) {
+      const ratio = width / height;
+      return Number.isFinite(ratio) && ratio > 0 ? ratio : undefined;
+    }
+    return undefined;
+  })();
+
+  const aspectRatioCategory: 'wide' | 'square' | 'tall' = (() => {
+    if (!normalizedAspectRatio) {
+      return 'square';
+    }
+    if (normalizedAspectRatio >= 1.15) {
+      return 'wide';
+    }
+    if (normalizedAspectRatio <= 0.85) {
+      return 'tall';
+    }
+    return 'square';
+  })();
+
+  const lineBreakPreference = request.lineBreakPreference ?? 'auto';
+  const lineBreakDirective = intent === 'text'
+    ? (() => {
+        switch (lineBreakPreference) {
+          case 'single-line':
+            return '- Lay the copy out on a single uninterrupted line. Adjust kerning or scale before wrapping, and never insert manual line breaks.';
+          case 'multi-line':
+            return '- Intentionally stack the copy across two balanced lines. Keep the lines centered vertically and do not invent extra decorative separators.';
+          default:
+            if (aspectRatioCategory === 'tall') {
+              return '- A two-line stack is acceptable because the hotspot is tall; cap it at two lines and keep both centered.';
+            }
+            if (aspectRatioCategory === 'wide') {
+              return '- Prefer a single line of text; only break onto a second line if it would otherwise be illegible at the given width.';
+            }
+            return '- Default to a single line. Allow a gentle two-line stack only if it meaningfully improves legibility.';
+        }
+      })()
+    : '';
+
   const buildPromptParts = (forceTransparent: boolean) => {
     const transparencyDirective = forceTransparent
       ? 'Your previous attempt produced a non-transparent background. Re-render the asset as a PNG with a genuine alpha channel. Trim away all backdrop pixels—checkerboards, solids, gradients, and photographic backplates are forbidden. Do not quit until the background is fully transparent.'
@@ -1031,10 +1240,12 @@ The asset must:
 - Be delivered as a single PNG with a fully transparent background (no residual canvas, no checkerboard fill).
 - Use the template's core palette: ${paletteText || 'n/a'}.
 - Reflect these typography treatments:\n${typographyBullets || '- Keep typography minimal if not provided.'}
+${targetedTypographyLine ? `${targetedTypographyLine}\n` : ''}
 ${textOnlyBullets ? `${textOnlyBullets}\n` : ''}${motifBullet}
 - Avoid flattening over the supplied references; treat them only as style cues.
 
 ${textDirective}
+${lineBreakDirective}
 ${descriptionDirective}
 ${placementDirective}
 ${brandDirective}
@@ -1050,7 +1261,7 @@ ${transparencyDirective}`
     ];
 
     if (request.hotspotCrop) {
-      promptParts.push({ text: 'Style reference crop (do NOT paste directly; study colors, linework, and texture only):' });
+      promptParts.push({ text: 'Style reference crop (do NOT paste directly; study colors, linework, hierarchy, and texture only):' });
       promptParts.push({ inlineData: { data: request.hotspotCrop.base64, mimeType: request.hotspotCrop.mimeType } });
     }
 

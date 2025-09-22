@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, ChangeEvent, FormEvent, useRef, MouseEvent, useMemo, MutableRefObject, CSSProperties } from 'react';
 import { removeBackground } from '@imgly/background-removal';
-import { UITemplate, BrandAsset, GeneratedImage, Mark, ChatMessage, TemplateStyleSnapshot } from '../types.ts';
+import { UITemplate, BrandAsset, GeneratedImage, Mark, ChatMessage, TemplateStyleSnapshot, TypographyRole } from '../types.ts';
 import { generateCreative, editCreativeWithChat, ChatEditOptions, generateHotspotAsset, generateTemplateStyleSnapshot } from '../services/geminiService.ts';
 import { fileToBase64, downloadImage, imageUrlToBase64, base64ToBlob } from '../utils/fileUtils.ts';
 import { SparklesIcon, ArrowLeftIcon, DownloadIcon, PaperclipIcon, SendIcon, PaletteIcon, XIcon, UploadCloudIcon, EditIcon } from './icons.tsx';
@@ -18,6 +18,15 @@ const DEFAULT_HOTSPOT_LABEL: Record<'text' | 'image', string> = {
   image: 'New image hotspot',
 };
 
+const TYPOGRAPHY_ROLE_OPTIONS: Array<{ value: TypographyRole; label: string; helper: string }> = [
+  { value: 'headline', label: 'Headline', helper: 'Bold, primary attention grabber' },
+  { value: 'subheading', label: 'Subheading', helper: 'Secondary line beneath the headline' },
+  { value: 'body', label: 'Body', helper: 'Longer descriptive copy' },
+  { value: 'caption', label: 'Caption', helper: 'Small supporting note or label' },
+  { value: 'accent', label: 'Accent', helper: 'Decorative or emphasis text' },
+  { value: 'decorative', label: 'Decorative', helper: 'Ornamental lettering, not meant for paragraphs' },
+];
+
 const resolveHotspotDisplayLabel = (mark: Mark): string => {
   const raw = (mark.label ?? '').trim();
   if (!raw || raw === DEFAULT_HOTSPOT_LABEL[mark.type]) {
@@ -29,6 +38,47 @@ const resolveHotspotDisplayLabel = (mark: Mark): string => {
 const isHotspotLabelPending = (mark: Mark): boolean => {
   const raw = (mark.label ?? '').trim();
   return !raw || raw === DEFAULT_HOTSPOT_LABEL[mark.type];
+};
+
+const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+const inferTypographyRoleFromLabel = (label: string): TypographyRole | null => {
+  const value = (label || '').toLowerCase();
+  if (!value) return null;
+  if (value.includes('headline') || value.includes('title') || value.includes('main heading')) {
+    return 'headline';
+  }
+  if (value.includes('subhead') || value.includes('sub-head') || value.includes('subtitle') || value.includes('subheading')) {
+    return 'subheading';
+  }
+  if (value.includes('body') || value.includes('paragraph') || value.includes('copy') || value.includes('description') || value.includes('details')) {
+    return 'body';
+  }
+  if (value.includes('caption') || value.includes('footnote') || value.includes('legal') || value.includes('disclaimer') || value.includes('small print')) {
+    return 'caption';
+  }
+  if (value.includes('tagline') || value.includes('cta') || value.includes('call to action') || value.includes('button') || value.includes('price')) {
+    return 'accent';
+  }
+  if (value.includes('decorative') || value.includes('ornament') || value.includes('flourish')) {
+    return 'decorative';
+  }
+  return null;
+};
+
+const withInferredTypographyRole = (mark: Mark): Mark => {
+  if (mark.type !== 'text') {
+    if (mark.typographyRole) {
+      const { typographyRole: _removed, ...rest } = mark;
+      return rest;
+    }
+    return mark;
+  }
+  if (mark.typographyRole) {
+    return mark;
+  }
+  const inferred = inferTypographyRoleFromLabel(mark.label ?? '');
+  return inferred ? { ...mark, typographyRole: inferred } : mark;
 };
 
 
@@ -107,6 +157,8 @@ interface HotspotAssetPlacement {
   signature: string;
   origin: 'ai-generated' | 'user-upload';
 }
+
+type TextLineMode = 'auto' | 'single-line' | 'multi-line';
 
 type RGB = { r: number; g: number; b: number };
 type HistogramEntry = { r: number; g: number; b: number; count: number };
@@ -230,24 +282,54 @@ const stripSolidBackground = (
   return updated;
 };
 
+const findOpaqueBounds = (
+  buffer: Uint8ClampedArray,
+  width: number,
+  height: number,
+  alphaThreshold = 4
+): { left: number; top: number; right: number; bottom: number } | null => {
+  let top = height;
+  let bottom = -1;
+  let left = width;
+  let right = -1;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const alpha = buffer[(y * width + x) * 4 + 3];
+      if (alpha > alphaThreshold) {
+        if (x < left) left = x;
+        if (x > right) right = x;
+        if (y < top) top = y;
+        if (y > bottom) bottom = y;
+      }
+    }
+  }
+
+  if (bottom === -1 || right === -1) {
+    return null;
+  }
+
+  return { left, top, right, bottom };
+};
+
 const prepareOverlayAsset = async (
   asset: { base64: string; mimeType: string; enforceTransparency: boolean }
 ): Promise<{ base64: string; mimeType: string; width: number; height: number; hasAlpha: boolean; usedMatting: boolean }> => {
   const dataUrl = `data:${asset.mimeType};base64,${asset.base64}`;
   const image = await loadImageElement(dataUrl);
-  const width = image.naturalWidth || image.width;
-  const height = image.naturalHeight || image.height;
-  const canvas = document.createElement('canvas');
+  let width = image.naturalWidth || image.width;
+  let height = image.naturalHeight || image.height;
+  let canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  let ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) {
     throw new Error('Unable to initialise canvas for overlay asset.');
   }
 
   ctx.drawImage(image, 0, 0, width, height);
-  const imageData = ctx.getImageData(0, 0, width, height);
-  const buffer = imageData.data;
+  let imageData = ctx.getImageData(0, 0, width, height);
+  let buffer = imageData.data;
   let hasAlpha = hasAnyTransparency(buffer);
   let usedMatting = false;
 
@@ -260,14 +342,12 @@ const prepareOverlayAsset = async (
       const transparentFile = new File([transparentBlob], 'overlay.png', { type: mimeType });
       const cleanedBase64 = await fileToBase64(transparentFile);
 
-      return {
+      const processed = await prepareOverlayAsset({
         base64: cleanedBase64,
         mimeType,
-        width,
-        height,
-        hasAlpha: true,
-        usedMatting: true,
-      };
+        enforceTransparency: false,
+      });
+      return { ...processed, usedMatting: true };
     } catch (error) {
       console.error('Background removal failed with @imgly/background-removal:', error);
     }
@@ -277,8 +357,34 @@ const prepareOverlayAsset = async (
       usedMatting = stripSolidBackground(buffer, width, height, background, 22);
       if (usedMatting) {
         ctx.putImageData(imageData, 0, 0);
+        imageData = ctx.getImageData(0, 0, width, height);
+        buffer = imageData.data;
         hasAlpha = hasAnyTransparency(buffer);
       }
+    }
+  }
+
+  const bounds = findOpaqueBounds(buffer, width, height, 4);
+  if (bounds) {
+    const trimmedWidth = Math.max(1, bounds.right - bounds.left + 1);
+    const trimmedHeight = Math.max(1, bounds.bottom - bounds.top + 1);
+    if (trimmedWidth > 0 && trimmedHeight > 0 && (trimmedWidth !== width || trimmedHeight !== height)) {
+      const trimmedCanvas = document.createElement('canvas');
+      trimmedCanvas.width = trimmedWidth;
+      trimmedCanvas.height = trimmedHeight;
+      const trimmedCtx = trimmedCanvas.getContext('2d');
+      if (!trimmedCtx) {
+        throw new Error('Unable to trim overlay asset.');
+      }
+      const croppedData = ctx.getImageData(bounds.left, bounds.top, trimmedWidth, trimmedHeight);
+      trimmedCtx.putImageData(croppedData, 0, 0);
+      canvas = trimmedCanvas;
+      ctx = trimmedCtx;
+      width = trimmedWidth;
+      height = trimmedHeight;
+      imageData = ctx.getImageData(0, 0, width, height);
+      buffer = imageData.data;
+      hasAlpha = hasAnyTransparency(buffer);
     }
   }
 
@@ -314,7 +420,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     : pendingTemplate
       ? [{ id: pendingTemplate.id, imageUrl: pendingTemplate.imageUrl, prompt: 'Original Template' }]
       : [];
-  const initialMarksSource = project?.initialMarks ?? pendingTemplate?.initialMarks ?? [];
+  const initialMarksSourceRaw = project?.initialMarks ?? pendingTemplate?.initialMarks ?? [];
+  const initialMarksSource = initialMarksSourceRaw.map(withInferredTypographyRole);
   const initialName = project?.name ?? pendingTemplate?.title ?? 'Untitled Project';
   const initialPrompt = project?.basePrompt ?? pendingTemplate?.prompt ?? '';
   const initialTemplateImageUrl = project?.templateImageUrl ?? pendingTemplate?.imageUrl ?? '';
@@ -338,6 +445,15 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         if (mark.type === 'text') {
             map[mark.id] = mark.text || `Your ${resolveHotspotDisplayLabel(mark)} Here`;
         }
+    });
+    return map;
+  });
+  const [textLineModes, setTextLineModes] = useState<Record<string, TextLineMode>>(() => {
+    const map: Record<string, TextLineMode> = {};
+    initialMarksSource.forEach(mark => {
+      if (mark.type === 'text') {
+        map[mark.id] = 'auto';
+      }
     });
     return map;
   });
@@ -398,6 +514,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   });
   const baseStyleImageRef = useRef<string>(history[0]?.imageUrl ?? initialTemplateImageUrl);
   const styleSnapshotPromiseRef = useRef<Promise<TemplateStyleSnapshot> | null>(null);
+  const templateImageDataRef = useRef<{ base64: string; mimeType: string; width: number; height: number } | null>(null);
+  const templateImageElementRef = useRef<HTMLImageElement | null>(null);
 
   const originalMarks = useMemo(() => project?.initialMarks ?? pendingTemplate?.initialMarks ?? [], [project, pendingTemplate]);
   const originalMarksMap = useMemo(() => {
@@ -409,7 +527,35 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   }, [originalMarks]);
 
   const updateMarkLabel = useCallback((markId: string, nextLabel: string) => {
-    setMarks(prev => prev.map(mark => (mark.id === markId ? { ...mark, label: nextLabel } : mark)));
+    setMarks(prev => prev.map(mark => {
+      if (mark.id !== markId) return mark;
+      const nextMarkBase: Mark = { ...mark, label: nextLabel };
+      if (mark.type !== 'text') {
+        return nextMarkBase;
+      }
+      const previousInferred = inferTypographyRoleFromLabel(mark.label ?? '');
+      const hasManualRole = !!mark.typographyRole && mark.typographyRole !== previousInferred;
+      if (hasManualRole) {
+        return nextMarkBase;
+      }
+      const nextInferred = inferTypographyRoleFromLabel(nextLabel);
+      if (nextInferred) {
+        return { ...nextMarkBase, typographyRole: nextInferred };
+      }
+      const { typographyRole: _removed, ...rest } = nextMarkBase;
+      return rest;
+    }));
+  }, []);
+
+  const updateMarkTypographyRole = useCallback((markId: string, nextRole: TypographyRole | '') => {
+    setMarks(prev => prev.map(mark => {
+      if (mark.id !== markId) return mark;
+      if (!nextRole) {
+        const { typographyRole, ...rest } = mark;
+        return rest;
+      }
+      return { ...mark, typographyRole: nextRole };
+    }));
   }, []);
 
   const canEnableMark = useCallback((markId: string, overrides?: {
@@ -460,26 +606,36 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   }, [canEnableMark]);
 
   const applyMarksFromSource = useCallback((sourceMarks: Mark[]) => {
-    setMarks(sourceMarks);
+    const normalizedMarks = sourceMarks.map(withInferredTypographyRole);
+    setMarks(normalizedMarks);
     setEnabledMarks(() => {
         const map: Record<string, boolean> = {};
-        sourceMarks.forEach(mark => {
+        normalizedMarks.forEach(mark => {
             map[mark.id] = false;
         });
         return map;
     });
     setTextFields(() => {
         const map: Record<string, string> = {};
-        sourceMarks.forEach(mark => {
+        normalizedMarks.forEach(mark => {
             if (mark.type === 'text') {
                 map[mark.id] = mark.text || `Your ${resolveHotspotDisplayLabel(mark)} Here`;
             }
         });
         return map;
     });
+    setTextLineModes(() => {
+      const map: Record<string, TextLineMode> = {};
+      normalizedMarks.forEach(mark => {
+        if (mark.type === 'text') {
+          map[mark.id] = 'auto';
+        }
+      });
+      return map;
+    });
     setImagePrompts(() => {
         const map: Record<string, string> = {};
-        sourceMarks.forEach(mark => {
+        normalizedMarks.forEach(mark => {
             if (mark.type === 'image') {
                 map[mark.id] = '';
             }
@@ -488,7 +644,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     });
     setImageModes(() => {
         const map: Record<string, 'upload' | 'describe'> = {};
-        sourceMarks.forEach(mark => {
+        normalizedMarks.forEach(mark => {
             if (mark.type === 'image') {
                 map[mark.id] = 'upload';
             }
@@ -510,7 +666,97 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
       img.src = toDataUrl(base64, mimeType);
     });
 
-  const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+  const ensureTemplateImageData = useCallback(async () => {
+    if (templateImageDataRef.current) {
+      return templateImageDataRef.current;
+    }
+    const sourceUrl = baseStyleImageRef.current || templateImageUrl;
+    if (!sourceUrl) {
+      throw new Error('Template image unavailable for style sampling.');
+    }
+    const data = await imageUrlToBase64(sourceUrl);
+    templateImageDataRef.current = data;
+    return data;
+  }, [templateImageUrl]);
+
+  const ensureTemplateImageElement = useCallback(async () => {
+    if (templateImageElementRef.current) {
+      return templateImageElementRef.current;
+    }
+    const { base64, mimeType } = await ensureTemplateImageData();
+    const dataUrl = toDataUrl(base64, mimeType);
+    const img = await loadImageElement(dataUrl);
+    templateImageElementRef.current = img;
+    return img;
+  }, [ensureTemplateImageData]);
+
+  const captureHotspotCrop = useCallback(async (mark: Mark): Promise<{ base64: string; mimeType: string } | null> => {
+    if (mark.type !== 'text' && mark.type !== 'image') {
+      return null;
+    }
+    const widthNorm = mark.width ?? mark.scale ?? 0;
+    const heightNorm = mark.height ?? mark.scale ?? 0;
+    if (widthNorm <= 0 || heightNorm <= 0) {
+      return null;
+    }
+    const [baseImageData, baseImageElement] = await Promise.all([
+      ensureTemplateImageData(),
+      ensureTemplateImageElement(),
+    ]);
+
+    const centerX = clamp(mark.x, 0, 1);
+    const centerY = clamp(mark.y, 0, 1);
+    const halfWidth = widthNorm / 2;
+    const halfHeight = heightNorm / 2;
+    const paddingX = Math.min(0.15, Math.max(widthNorm * 0.25, 0.03));
+    const paddingY = Math.min(0.15, Math.max(heightNorm * 0.25, 0.03));
+
+    const leftNorm = clamp(centerX - halfWidth - paddingX, 0, 1);
+    const rightNorm = clamp(centerX + halfWidth + paddingX, leftNorm, 1);
+    const topNorm = clamp(centerY - halfHeight - paddingY, 0, 1);
+    const bottomNorm = clamp(centerY + halfHeight + paddingY, topNorm, 1);
+    const normalizedWidth = rightNorm - leftNorm;
+    const normalizedHeight = bottomNorm - topNorm;
+    if (normalizedWidth <= 0 || normalizedHeight <= 0) {
+      return null;
+    }
+
+    const widthPx = Math.max(4, Math.round(normalizedWidth * baseImageData.width));
+    const heightPx = Math.max(4, Math.round(normalizedHeight * baseImageData.height));
+    if (widthPx <= 4 || heightPx <= 4) {
+      return null;
+    }
+
+    const sourceLeftPx = Math.round(leftNorm * baseImageData.width);
+    const sourceTopPx = Math.round(topNorm * baseImageData.height);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = widthPx;
+    canvas.height = heightPx;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return null;
+    }
+
+    ctx.drawImage(
+      baseImageElement,
+      sourceLeftPx,
+      sourceTopPx,
+      widthPx,
+      heightPx,
+      0,
+      0,
+      widthPx,
+      heightPx
+    );
+
+    const dataUrl = canvas.toDataURL('image/png');
+    const [, base64] = dataUrl.split(',');
+    if (!base64) {
+      return null;
+    }
+    return { base64, mimeType: 'image/png' };
+  }, [ensureTemplateImageData, ensureTemplateImageElement]);
 
   const ensureStyleSnapshot = useCallback(async (): Promise<TemplateStyleSnapshot> => {
     if (styleSnapshot) {
@@ -609,7 +855,11 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const getAssetSignature = useCallback((mark: Mark): string | null => {
     if (mark.type === 'text') {
       const text = (textFields[mark.id] ?? '').trim();
-      return text ? `text:${text}` : null;
+      if (!text) {
+        return null;
+      }
+      const lineMode = textLineModes[mark.id] ?? 'auto';
+      return `text:${lineMode}:${text}`;
     }
     const mode = imageModes[mark.id] || 'upload';
     if (mode === 'upload') {
@@ -618,7 +868,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     }
     const prompt = (imagePrompts[mark.id] ?? '').trim();
     return prompt ? `describe:${prompt}` : null;
-  }, [textFields, imageModes, imageAssets, imagePrompts]);
+  }, [textFields, textLineModes, imageModes, imageAssets, imagePrompts]);
 
   const updateAssetPlacement = useCallback((markId: string, updates: Partial<HotspotAssetPlacement> | ((current: HotspotAssetPlacement) => Partial<HotspotAssetPlacement> | null)) => {
     setGeneratedAssets(prev => {
@@ -671,6 +921,32 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
       return changed ? next : prev;
     });
   }, [marks, getAssetSignature]);
+
+  useEffect(() => {
+    setTextLineModes(prev => {
+      let changed = false;
+      const next: Record<string, TextLineMode> = { ...prev };
+      Object.keys(next).forEach(markId => {
+        const mark = marks.find(m => m.id === markId && m.type === 'text');
+        if (!mark) {
+          delete next[markId];
+          changed = true;
+        }
+      });
+      marks.forEach(mark => {
+        if (mark.type === 'text' && next[mark.id] === undefined) {
+          next[mark.id] = 'auto';
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [marks]);
+
+  useEffect(() => {
+    templateImageDataRef.current = null;
+    templateImageElementRef.current = null;
+  }, [templateImageUrl]);
 
   const [mentionSuggestions, setMentionSuggestions] = useState<{ id: string; label: string; type: string; isIncluded: boolean }[]>([]);
   const [, setMentionQuery] = useState('');
@@ -1113,6 +1389,13 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
           if (mark.type === 'text') {
             const textContent = (textFields[mark.id] ?? '').trim();
+            const lineBreakPreference = textLineModes[mark.id] ?? 'auto';
+            const typographyStyle = mark.typographyRole
+              ? snapshot.typography.find(style => style.role === mark.typographyRole)
+              : undefined;
+            const inferredRole = inferTypographyRoleFromLabel(mark.label ?? '') ?? undefined;
+            const typographyRoleHint = mark.typographyRole ?? inferredRole;
+            const hotspotCrop = await captureHotspotCrop(mark);
             const asset = await generateHotspotAsset({
               styleSnapshot: snapshot,
               intent: 'text',
@@ -1124,7 +1407,18 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
               sizeHint: {
                 widthPx: Math.round((mark.width ?? mark.scale ?? 0) * templateWidth),
                 heightPx: Math.round((mark.height ?? mark.scale ?? 0) * templateHeight),
+                aspectRatio: (() => {
+                  const widthNorm = mark.width ?? mark.scale ?? 0;
+                  const heightNorm = mark.height ?? mark.scale ?? 0;
+                  if (widthNorm <= 0 || heightNorm <= 0) return undefined;
+                  const ratio = widthNorm / heightNorm;
+                  return Number.isFinite(ratio) && ratio > 0 ? ratio.toFixed(3) : undefined;
+                })(),
               },
+              typographyStyle,
+              typographyRoleHint,
+              hotspotCrop: hotspotCrop ?? undefined,
+              lineBreakPreference,
             });
             const prepared = await prepareOverlayAsset({
               base64: asset.base64,
@@ -1176,6 +1470,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
             };
           } else {
             const prompt = (imagePrompts[mark.id] ?? '').trim();
+            const hotspotCrop = await captureHotspotCrop(mark);
             const asset = await generateHotspotAsset({
               styleSnapshot: snapshot,
               intent: 'image',
@@ -1188,6 +1483,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                 widthPx: Math.round((mark.width ?? mark.scale ?? 0) * templateWidth),
                 heightPx: Math.round((mark.height ?? mark.scale ?? 0) * templateHeight),
               },
+              hotspotCrop: hotspotCrop ?? undefined,
             });
             const prepared = await prepareOverlayAsset({
               base64: asset.base64,
@@ -1237,6 +1533,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
       setChatMessages(prev => [...prev, assistantMessage]);
 
       baseStyleImageRef.current = latestBaseImageUrl;
+      templateImageDataRef.current = null;
+      templateImageElementRef.current = null;
     } catch (e) {
       const errorMessage = e instanceof Error ? e.message : 'An unknown error occurred during generation.';
       const errorMsg: ChatMessage = { id: `err-${Date.now()}`, role: 'assistant', type: 'error', text: errorMessage };
@@ -1265,6 +1563,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     brandColors,
     buildHotspotSummary,
     computeAspectRatioHint,
+    captureHotspotCrop,
   ]);
 
   const handleGenerateClick = useCallback(() => {
@@ -1510,6 +1809,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         label,
         type: isPlacingMark,
         isNew: true,
+        category: 'content',
     });
   };
 
@@ -1553,10 +1853,11 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         scale: Math.max(width, height),
     };
 
-    setMarks(prev => [...prev, newMark]);
+    setMarks(prev => [...prev, withInferredTypographyRole(newMark)]);
     setEnabledMarks(prev => ({ ...prev, [newMark.id]: false }));
     if (newMark.type === 'text') {
         setTextFields(prev => ({ ...prev, [newMark.id]: '' }));
+        setTextLineModes(prev => ({ ...prev, [newMark.id]: 'auto' }));
     }
     if (newMark.type === 'image') {
         setImageModes(prev => ({ ...prev, [newMark.id]: 'upload' }));
@@ -1659,6 +1960,26 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     const includeReady = canEnableMark(markId);
     const generatedAsset = generatedAssets[markId];
     const assetScaleValue = generatedAsset ? Math.round(generatedAsset.scale * 100) : 100;
+    const typographyRoleValue = activeMark.typographyRole ?? '';
+    const lineBreakPreference = textLineModes[markId] ?? 'auto';
+    const handleLineBreakChange = (mode: TextLineMode) => {
+      setTextLineModes(prev => ({ ...prev, [markId]: mode }));
+    };
+    const lineBreakOptions: Array<{ key: TextLineMode; label: string }> = [
+      { key: 'auto', label: 'Auto' },
+      { key: 'single-line', label: 'Single' },
+      { key: 'multi-line', label: 'Stack' },
+    ];
+    const lineBreakDescription = (() => {
+      switch (lineBreakPreference) {
+        case 'single-line':
+          return 'Keep the copy on one line and prevent new line breaks unless absolutely required.';
+        case 'multi-line':
+          return 'Encourage the AI to stack the copy across two balanced lines when it makes sense.';
+        default:
+          return 'Let the AI decide. It prefers a single line unless the hotspot is tall or text needs breathing room.';
+      }
+    })();
 
     const normalizedLabel = (activeMark.label ?? '').toLowerCase();
     const textRows = normalizedLabel.includes('body') ? 4 : 2;
@@ -1759,6 +2080,32 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                         <p className={`text-xs ${labelPending ? 'text-amber-600' : 'text-gray-500'}`}>{labelPending ? 'Give this hotspot a clear name so the AI knows what to edit.' : 'This name is used for @mentions and generation instructions.'}</p>
                     </div>
 
+                    {isText && (
+                      <div className="space-y-2">
+                        <label className="text-sm font-semibold text-gray-800" htmlFor={`typography-role-${markId}`}>
+                          Style role
+                        </label>
+                        <select
+                          id={`typography-role-${markId}`}
+                          value={typographyRoleValue}
+                          onChange={event => updateMarkTypographyRole(markId, event.target.value as TypographyRole || '')}
+                          className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                        >
+                          <option value="">Let AI infer</option>
+                          {TYPOGRAPHY_ROLE_OPTIONS.map(option => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        <p className="text-xs text-gray-500">
+                          {typographyRoleValue
+                            ? TYPOGRAPHY_ROLE_OPTIONS.find(option => option.value === typographyRoleValue)?.helper
+                            : 'Optional: pick the typographic role Gemini should mimic for this text.'}
+                        </p>
+                      </div>
+                    )}
+
                     <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
                         <div>
                             <p className="text-xs font-semibold uppercase text-gray-600">Include in next render</p>
@@ -1778,6 +2125,26 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
                     {isText && (
                         <div className="space-y-3">
+                            <div className="space-y-2">
+                                <span className="text-xs font-semibold uppercase text-gray-600">Line breaks</span>
+                                <div className="grid grid-cols-3 gap-2">
+                                    {lineBreakOptions.map(option => (
+                                      <button
+                                        key={option.key}
+                                        type="button"
+                                        onClick={() => handleLineBreakChange(option.key)}
+                                        className={`rounded-lg px-3 py-2 text-xs font-semibold transition-colors ${
+                                          lineBreakPreference === option.key
+                                            ? 'bg-emerald-600 text-white shadow'
+                                            : 'bg-slate-100 text-gray-600 hover:bg-slate-200'
+                                        }`}
+                                      >
+                                        {option.label}
+                                      </button>
+                                    ))}
+                                </div>
+                                <p className="text-xs text-gray-500">{lineBreakDescription}</p>
+                            </div>
                             <label className="text-sm font-semibold text-gray-800" htmlFor={`hotspot-text-${markId}`}>Replacement copy</label>
                             <textarea
                                 id={`hotspot-text-${markId}`}

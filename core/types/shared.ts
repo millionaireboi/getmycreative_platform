@@ -15,6 +15,8 @@ export interface GeneratedImage {
   prompt: string;
 }
 
+export type MarkCategory = 'content' | 'decorative' | 'silhouette' | 'background';
+
 export interface Mark {
   id: string; // e.g., 'logo', 'headline', 'phoneNumber' - AI-generated
   x: number; // normalized 0-1 (center)
@@ -25,7 +27,9 @@ export interface Mark {
   label: string; // e.g., 'Logo', 'Headline', 'Phone Number' - AI-generated
   type: 'text' | 'image';
   text?: string; // OCR'd text content for more specific prompts
+  typographyRole?: TypographyRole; // Optional style role chosen by designer for text hotspots
   isNew?: boolean; // Flag for dynamically added marks
+  category?: MarkCategory; // Visual intent classification to distinguish decorative/background regions
 }
 
 export type TypographyRole =

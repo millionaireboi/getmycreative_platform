@@ -246,20 +246,23 @@ export const createTemplate = async (
     const now = new Date();
     const serializedStyleSnapshot = serializeStyleSnapshot(initialData?.styleSnapshot);
     const paletteFromSnapshot = initialData?.styleSnapshot?.palette ?? [];
+    const marks = initialData?.marks ?? [];
+    const imageMarksForPlaceholders = marks.filter(mark => mark.type === 'image' && (!mark.category || mark.category === 'content'));
+    const textMarks = marks.filter(mark => mark.type === 'text');
     const newTemplateData = {
         designerId,
         imageUrl,
         title,
-        initialMarks: initialData?.marks || [],
+        initialMarks: marks,
         prompt: initialData?.prompt || '',
         tags: initialData?.tags || [],
         useCases: initialData?.useCases || [],
         category: '',
         placeholders: {
-            logo: initialData?.marks?.some(m => m.type === 'image' && m.id.includes('logo')) || false,
-            productImage: initialData?.marks?.some(m => m.type === 'image' && !m.id.includes('logo')) || false,
-            headline: initialData?.marks?.some(m => m.type === 'text' && m.id.includes('headline')) || false,
-            body: initialData?.marks?.some(m => m.type === 'text' && m.id.includes('body')) || false,
+            logo: imageMarksForPlaceholders.some(m => m.id.includes('logo')),
+            productImage: imageMarksForPlaceholders.some(m => !m.id.includes('logo')),
+            headline: textMarks.some(m => m.id.includes('headline')),
+            body: textMarks.some(m => m.id.includes('body')),
         },
         status: TemplateStatus.DRAFT,
         version: 1,
