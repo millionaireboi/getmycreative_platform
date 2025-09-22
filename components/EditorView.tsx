@@ -1,9 +1,9 @@
-import { useState, useCallback, useEffect, ChangeEvent, FormEvent, useRef, MouseEvent, useMemo, MutableRefObject, CSSProperties } from 'react';
+import { useState, useCallback, useEffect, ChangeEvent, FormEvent, useRef, MouseEvent, useMemo, MutableRefObject, CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
 import { removeBackground } from '@imgly/background-removal';
 import { UITemplate, BrandAsset, GeneratedImage, Mark, ChatMessage, TemplateStyleSnapshot, TypographyRole } from '../types.ts';
 import { generateCreative, editCreativeWithChat, ChatEditOptions, generateHotspotAsset, generateTemplateStyleSnapshot } from '../services/geminiService.ts';
 import { fileToBase64, downloadImage, imageUrlToBase64, base64ToBlob } from '../utils/fileUtils.ts';
-import { SparklesIcon, ArrowLeftIcon, DownloadIcon, PaperclipIcon, SendIcon, PaletteIcon, XIcon, UploadCloudIcon, EditIcon } from './icons.tsx';
+import { SparklesIcon, ArrowLeftIcon, DownloadIcon, PaperclipIcon, SendIcon, PaletteIcon, XIcon, UploadCloudIcon, EditIcon, FileTextIcon, ImageIcon } from './icons.tsx';
 import CreativeElement from './CreativeElement.tsx';
 
 import { BRAND_PALETTES } from '../constants.ts';
@@ -495,6 +495,13 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const [isPlacingMark, setIsPlacingMark] = useState<'text' | 'image' | null>(null);
   const [hoveredMarkId, setHoveredMarkId] = useState<string | null>(null);
 
+  const [canvasScale, setCanvasScale] = useState(1);
+  const [canvasOffset, setCanvasOffset] = useState({ x: 0, y: 0 });
+  const [isSpacePressed, setIsSpacePressed] = useState(false);
+  const panSessionRef = useRef<{ pointerId: number; start: { x: number; y: number }; origin: { x: number; y: number } } | null>(null);
+  const canvasViewportRef = useRef<HTMLDivElement | null>(null);
+  const canvasContentRef = useRef<HTMLDivElement | null>(null);
+
   const [activeHotspotId, setActiveHotspotId] = useState<string | null>(null);
   const [isChatDrawerOpen, setIsChatDrawerOpen] = useState(false);
 
@@ -794,7 +801,6 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   };
 
   const includedMarks = useMemo(() => marks.filter(mark => enabledMarks[mark.id]), [marks, enabledMarks]);
-  const ignoredMarks = useMemo(() => marks.filter(mark => !enabledMarks[mark.id]), [marks, enabledMarks]);
 
   const readyIncludedMarks = useMemo(() => includedMarks.filter(mark => canEnableMark(mark.id)), [includedMarks, canEnableMark]);
 
@@ -805,6 +811,13 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
   const missingIncludedMarksCount = Math.max(0, includedMarks.length - readyIncludedMarks.length);
 
+  const editableFields = useMemo(() => {
+    return marks.map(mark => ({
+      mark,
+      isEnabled: !!enabledMarks[mark.id],
+    }));
+  }, [marks, enabledMarks]);
+
   const buildHotspotSummary = (mark: Mark): string => {
     const widthPercent = Math.round((mark.width ?? mark.scale ?? 0) * 100);
     const heightPercent = Math.round((mark.height ?? mark.scale ?? 0) * 100);
@@ -812,6 +825,13 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     const centerY = Math.round(mark.y * 100);
     return `Hotspot is roughly ${widthPercent}% of the canvas width by ${heightPercent}% of the height, centered around ${centerX}% across and ${centerY}% down.`;
   };
+
+  const focusHotspot = useCallback((markId: string) => {
+    setShowHotspotOverlay(true);
+    setIsPlacingMark(null);
+    lastFocusedHotspotIdRef.current = markId;
+    setActiveHotspotId(markId);
+  }, [setActiveHotspotId, setIsPlacingMark, setShowHotspotOverlay]);
 
   const getAssetDisplayMetrics = (asset: HotspotAssetPlacement) => {
     const widthPercent = clamp(asset.baseWidthPercent * asset.scale, 2, 400);
@@ -1059,6 +1079,11 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     const frame = requestAnimationFrame(() => updateImageBounds());
     return () => cancelAnimationFrame(frame);
   }, [activeImageUrl, updateImageBounds]);
+
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => updateImageBounds());
+    return () => cancelAnimationFrame(frame);
+  }, [canvasScale, canvasOffset.x, canvasOffset.y, updateImageBounds]);
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => updateImageBounds());
@@ -1784,8 +1809,114 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     drawStartRef.current = null;
   };
 
+  const resetPanZoom = useCallback(() => {
+    setCanvasScale(1);
+    setCanvasOffset({ x: 0, y: 0 });
+  }, []);
+
+  const handleCanvasPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!(event.button === 1 || (event.button === 0 && isSpacePressed))) {
+      return;
+    }
+
+    const viewport = canvasViewportRef.current;
+    if (!viewport) return;
+
+    panSessionRef.current = {
+      pointerId: event.pointerId,
+      start: { x: event.clientX, y: event.clientY },
+      origin: { x: canvasOffset.x, y: canvasOffset.y },
+    };
+
+    viewport.setPointerCapture(event.pointerId);
+    event.preventDefault();
+    event.stopPropagation();
+  }, [canvasOffset, isSpacePressed]);
+
+  const handleCanvasPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const session = panSessionRef.current;
+    if (!session || session.pointerId !== event.pointerId) {
+      return;
+    }
+
+    event.preventDefault();
+    const nextOffset = {
+      x: session.origin.x + (event.clientX - session.start.x),
+      y: session.origin.y + (event.clientY - session.start.y),
+    };
+    setCanvasOffset(nextOffset);
+  }, []);
+
+  const releasePanSession = useCallback((pointerId: number) => {
+    const viewport = canvasViewportRef.current;
+    if (viewport && viewport.hasPointerCapture(pointerId)) {
+      viewport.releasePointerCapture(pointerId);
+    }
+    panSessionRef.current = null;
+  }, []);
+
+  const handleCanvasPointerUp = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const session = panSessionRef.current;
+    if (!session || session.pointerId !== event.pointerId) {
+      return;
+    }
+    event.preventDefault();
+    releasePanSession(event.pointerId);
+  }, [releasePanSession]);
+
+  const handleCanvasPointerCancel = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const session = panSessionRef.current;
+    if (!session || session.pointerId !== event.pointerId) {
+      return;
+    }
+    releasePanSession(event.pointerId);
+  }, [releasePanSession]);
+
+  const handleCanvasWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+    if (!(event.ctrlKey || event.metaKey)) {
+      return;
+    }
+    event.preventDefault();
+    const viewport = canvasViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    const rect = viewport.getBoundingClientRect();
+    const pointer = {
+      x: event.clientX - (rect.left + rect.width / 2),
+      y: event.clientY - (rect.top + rect.height / 2),
+    };
+
+    const zoomFactor = event.deltaY < 0 ? 1.05 : 0.95;
+    const nextScaleRaw = canvasScale * zoomFactor;
+    const nextScale = clamp(nextScaleRaw, 0.25, 4);
+    if (nextScale === canvasScale) {
+      return;
+    }
+
+    const prevScale = canvasScale;
+    setCanvasScale(nextScale);
+    setCanvasOffset(prev => {
+      const contentPoint = {
+        x: (pointer.x - prev.x) / prevScale,
+        y: (pointer.y - prev.y) / prevScale,
+      };
+      return {
+        x: pointer.x - nextScale * contentPoint.x,
+        y: pointer.y - nextScale * contentPoint.y,
+      };
+    });
+  }, [canvasScale]);
+
+  const handleCanvasDoubleClick = useCallback(() => {
+    resetPanZoom();
+  }, [resetPanZoom]);
+
   const handleCanvasMouseDown = (event: MouseEvent<HTMLDivElement>) => {
     if (!isPlacingMark) return;
+    if (isSpacePressed || panSessionRef.current) return;
+    if (event.button !== 0) return;
 
     const target = event.target as HTMLElement;
     if (target.closest('[data-hotspot-button="true"]')) return;
@@ -1815,6 +1946,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
   const handleCanvasMouseMove = (event: MouseEvent<HTMLDivElement>) => {
     if (!isDrawingMark || !drawStartRef.current) return;
+    if (isSpacePressed || panSessionRef.current) return;
     const current = getNormalizedPoint(event);
     if (!current) return;
     const start = drawStartRef.current;
@@ -2533,358 +2665,468 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     }
   }, [invalidMentions]);
 
-  return (
-    <div className="min-h-screen bg-slate-100">
-      <div className="container mx-auto px-4 lg:px-8 py-6">
-        <button onClick={onBack} className="flex items-center gap-2 text-sm text-gray-600 hover:text-gray-900 font-medium mb-6">
-          <ArrowLeftIcon className="w-4 h-4" />
-          Back to Dashboard
-        </button>
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.code !== 'Space' || event.repeat) {
+        return;
+      }
+      const target = event.target as HTMLElement | null;
+      if (target && target.closest('input, textarea, [contenteditable="true"]')) {
+        return;
+      }
+      setIsSpacePressed(true);
+    };
 
-        <div className="mx-auto w-full max-w-6xl space-y-8 pb-24">
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex items-center gap-3 group/editor" onDoubleClick={() => setIsEditingName(true)}>
-              <SparklesIcon className="w-6 h-6 text-emerald-600" />
-              {isEditingName ? (
-                <input
-                  ref={nameInputRef}
-                  type="text"
-                  value={projectName}
-                  onChange={e => setProjectName(e.target.value)}
-                  onBlur={handleProjectNameBlur}
-                  onKeyDown={e => e.key === 'Enter' && handleProjectNameBlur()}
-                  className="-ml-1 rounded-md bg-slate-100 px-1 text-xl font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                />
-              ) : (
-                <h2 className="text-xl font-bold text-gray-800 font-display">{projectName}</h2>
-              )}
-              <button onClick={() => setIsEditingName(true)} className="opacity-0 transition-opacity group-hover/editor:opacity-100">
-                <EditIcon className="h-4 w-4 text-gray-400" />
-              </button>
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.code === 'Space') {
+        setIsSpacePressed(false);
+      }
+    };
+
+    const handleWindowBlur = () => setIsSpacePressed(false);
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleWindowBlur);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleWindowBlur);
+    };
+  }, []);
+
+  const versionsPanel = (
+    <div className="space-y-4">
+      <p className="text-sm font-semibold uppercase tracking-wide text-gray-600">Versions</p>
+      <VersionHistory history={history} activeIndex={activeIndex} onSelect={setActiveIndex} />
+    </div>
+  );
+
+  const inspectorPanel = (
+    <div className="space-y-4">
+      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold text-gray-800">Editable fields</p>
+            <p className="mt-1 text-xs text-gray-500">Tap a field to tweak it in the editor. Green cards are included, red cards are currently skipped.</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowHotspotOverlay(prev => !prev)}
+            className="text-xs font-semibold text-emerald-600 hover:text-emerald-700"
+          >
+            {showHotspotOverlay ? 'Hide overlays' : 'Show overlays'}
+          </button>
+        </div>
+        <div className="mt-4 space-y-2">
+          {editableFields.length > 0 ? (
+            editableFields.map(({ mark, isEnabled }) => {
+              const isActive = activeHotspotId === mark.id;
+              const typeIcon = mark.type === 'text'
+                ? <FileTextIcon className="h-4 w-4" />
+                : <ImageIcon className="h-4 w-4" />;
+              const cardStateClasses = isEnabled
+                ? 'border-emerald-300 bg-emerald-50 hover:border-emerald-400 hover:bg-emerald-100'
+                : 'border-rose-300 bg-rose-50 hover:border-rose-400 hover:bg-rose-100';
+              const cardClasses = `flex cursor-pointer items-center gap-3 rounded-xl border px-3 py-3 transition-colors ${cardStateClasses} ${
+                isActive ? 'ring-2 ring-emerald-400 ring-offset-2' : ''
+              }`;
+              const iconWrapperClasses = `flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full border ${
+                mark.type === 'text' ? 'border-sky-200 bg-sky-50 text-sky-600' : 'border-purple-200 bg-purple-50 text-purple-600'
+              }`;
+              return (
+                <button
+                  key={mark.id}
+                  type="button"
+                  onClick={() => focusHotspot(mark.id)}
+                  className={cardClasses}
+                >
+                  <span className={iconWrapperClasses}>{typeIcon}</span>
+                  <div className="flex-1 text-left">
+                    <p className="text-sm font-semibold text-gray-900">{resolveHotspotDisplayLabel(mark)}</p>
+                  </div>
+                </button>
+              );
+            })
+          ) : (
+            <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-center">
+              <p className="text-sm font-semibold text-gray-700">No fields yet</p>
+              <p className="mt-1 text-xs text-gray-500">Add a text or image field below to start editing.</p>
             </div>
-            <div className="text-xs text-gray-500">
+          )}
+        </div>
+        <p className="mt-4 text-xs text-gray-500">
+          {marks.length} hotspot{marks.length === 1 ? '' : 's'} detected · {includedMarks.length} included · {missingIncludedMarksCount} need input
+        </p>
+        <div className="mt-5 rounded-xl border border-slate-200 bg-slate-50 p-4">
+          <p className="text-xs font-semibold uppercase tracking-wide text-gray-600">Add hotspots</p>
+          <p className="mt-1 text-xs text-gray-500">Drop a new text or image layer anywhere on the template.</p>
+          <div className="mt-3 flex flex-col gap-2">
+            <button
+              onClick={() => setIsPlacingMark('text')}
+              className={`w-full rounded-lg border px-3 py-2 text-sm font-semibold transition-colors ${
+                isPlacingMark === 'text' ? 'border-emerald-500 bg-emerald-500 text-white shadow-sm' : 'border-slate-200 bg-white text-gray-700 hover:bg-slate-100'
+              }`}
+            >
+              Add text hotspot
+            </button>
+            <button
+              onClick={() => setIsPlacingMark('image')}
+              className={`w-full rounded-lg border px-3 py-2 text-sm font-semibold transition-colors ${
+                isPlacingMark === 'image' ? 'border-emerald-500 bg-emerald-500 text-white shadow-sm' : 'border-slate-200 bg-white text-gray-700 hover:bg-slate-100'
+              }`}
+            >
+              Add image hotspot
+            </button>
+            {isPlacingMark && (
+              <button onClick={() => setIsPlacingMark(null)} className="text-sm font-medium text-gray-500 hover:text-gray-700">
+                Cancel placement
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+        <p className="text-sm font-semibold text-gray-800">Aspect ratio</p>
+        <p className="mt-1 text-xs text-gray-500">Pick the format for your next render.</p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {['original', '1:1', '16:9', '9:16'].map(option => (
+            <button
+              key={option}
+              type="button"
+              onClick={() => setAspectRatio(option)}
+              className={`min-w-[80px] rounded-lg px-4 py-2 text-sm font-semibold transition-colors whitespace-nowrap text-center ${
+                aspectRatio === option ? 'border border-emerald-500 bg-emerald-100 text-emerald-700 shadow-sm' : 'border border-slate-200 bg-slate-50 text-gray-600 hover:bg-white'
+              }`}
+            >
+              {option === 'original' ? 'Original' : option}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+        <div className="flex items-center justify-between">
+          <p className="text-sm font-semibold text-gray-800">Brand palette</p>
+          <button
+            type="button"
+            onClick={() => setIsSettingsOpen(true)}
+            className="text-xs font-semibold text-emerald-600 hover:text-emerald-700"
+          >
+            Adjust
+          </button>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          {brandColors.length > 0 ? (
+            brandColors.map(color => (
+              <span
+                key={color}
+                className="h-7 w-7 rounded-full border border-white shadow-sm"
+                style={{ backgroundColor: color }}
+                title={color}
+              />
+            ))
+          ) : (
+            <p className="text-xs text-gray-500 leading-relaxed">Stick with the template colors or tap Adjust to choose your brand palette.</p>
+          )}
+        </div>
+        {isSettingsOpen && (
+          <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4 shadow-lg">
+            <ColorPaletteSelector
+              selectedPalette={brandColors}
+              onPaletteChange={palette => {
+                setBrandColors(palette);
+                setIsSettingsOpen(false);
+              }}
+              userBrandColors={appUser?.brandColors}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  const scaleDisplay = `${Math.round(canvasScale * 100)}%`;
+
+  return (
+    <div className="flex h-screen bg-slate-100">
+      <div className="flex flex-1 flex-col overflow-hidden">
+        <header className="border-b border-slate-200 bg-white">
+          <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4 px-4 py-4 lg:px-8">
+            <div className="flex flex-1 items-center gap-4">
+              <button
+                onClick={onBack}
+                className="flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-gray-600 transition hover:border-emerald-500 hover:text-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+              >
+                <ArrowLeftIcon className="h-4 w-4" />
+                <span className="hidden sm:inline">Back</span>
+              </button>
+              <div className="flex items-center gap-3 group/editor" onDoubleClick={() => setIsEditingName(true)}>
+                <SparklesIcon className="h-6 w-6 text-emerald-600" />
+                {isEditingName ? (
+                  <input
+                    ref={nameInputRef}
+                    type="text"
+                    value={projectName}
+                    onChange={e => setProjectName(e.target.value)}
+                    onBlur={handleProjectNameBlur}
+                    onKeyDown={e => e.key === 'Enter' && handleProjectNameBlur()}
+                    className="-ml-1 rounded-md bg-slate-100 px-2 text-lg font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  />
+                ) : (
+                  <h2 className="text-lg font-bold text-gray-800 font-display sm:text-xl">{projectName}</h2>
+                )}
+                <button onClick={() => setIsEditingName(true)} className="opacity-0 transition-opacity group-hover/editor:opacity-100">
+                  <EditIcon className="h-4 w-4 text-gray-400" />
+                </button>
+              </div>
+            </div>
+            <div className="hidden flex-shrink-0 text-xs text-gray-500 sm:block">
               {marks.length} hotspot{marks.length === 1 ? '' : 's'} detected · {includedMarks.length} included · {missingIncludedMarksCount} need input
             </div>
           </div>
+        </header>
 
-          <div className="grid gap-8 lg:grid-cols-[220px_minmax(0,1fr)_240px]">
-            <aside className="space-y-4">
-              <p className="text-sm font-semibold uppercase tracking-wide text-gray-600">Versions</p>
-              <VersionHistory history={history} activeIndex={activeIndex} onSelect={setActiveIndex} />
-            </aside>
-
-            <div
-              ref={imagePreviewRef}
-              onMouseDown={handleCanvasMouseDown}
-              onMouseMove={handleCanvasMouseMove}
-              onMouseUp={handleCanvasMouseUp}
-              onMouseLeave={() => {
-                if (isDrawingMark) {
-                  cancelDraftMark();
-                }
-              }}
-              className={`group relative overflow-hidden rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6 ${isPlacingMark ? 'cursor-crosshair' : ''}`}
-            >
-              <img
-                ref={imageElementRef}
-                src={activeImageUrl}
-                alt="Creative Preview"
-                className="mx-auto h-auto max-h-[70vh] w-full max-w-4xl object-contain"
-                onLoad={updateImageBounds}
-              />
-              <div className="absolute right-4 top-4 rounded-full bg-black/50 px-2 py-1 text-xs text-white">
-                {activeIndex === 0 ? 'Template' : `Version ${activeIndex}`}
+        <div className="flex flex-1 overflow-hidden">
+          <aside className="hidden h-full w-72 flex-shrink-0 border-r border-slate-200 bg-white lg:flex">
+            <div className="flex h-full w-full flex-col overflow-hidden">
+              <div className="border-b border-slate-200 px-4 py-3">
+                <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Timeline</p>
               </div>
-              {activeImage && (
-                <div className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-2xl bg-black/60 opacity-0 transition-opacity group-hover:opacity-100">
-                  <button
-                    onClick={handleDownload}
-                    disabled={!canDownloadActiveImage}
-                    className={`pointer-events-auto flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold transition ${
-                      canDownloadActiveImage
-                        ? 'bg-white text-black hover:bg-white/90'
-                        : 'cursor-not-allowed bg-white/70 text-gray-500'
-                    }`}
-                  >
-                    <DownloadIcon className="h-4 w-4" /> Download
-                  </button>
-                </div>
-              )}
-              {imageBounds.width > 0 && imageBounds.height > 0 && (
-                <div
-                  className={`absolute ${showHotspotOverlay || isPlacingMark ? '' : 'pointer-events-none'}`}
-                  style={{
-                    left: imageBounds.left,
-                    top: imageBounds.top,
-                    width: imageBounds.width,
-                    height: imageBounds.height,
-                  }}
+              <div className="flex-1 overflow-y-auto px-4 py-6">
+                {versionsPanel}
+              </div>
+            </div>
+          </aside>
+
+          <main className="flex flex-1 flex-col overflow-hidden">
+            <div className="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-2 text-xs text-gray-500 sm:px-6">
+              <span className="hidden sm:block">Hold space to pan · Cmd/Ctrl + scroll to zoom · Double-click to reset</span>
+              <div className="ml-auto flex items-center gap-3">
+                <span className="rounded-full bg-slate-100 px-3 py-1 font-semibold text-gray-700">{scaleDisplay}</span>
+                <button
+                  type="button"
+                  onClick={resetPanZoom}
+                  className="rounded-full border border-slate-200 px-3 py-1 font-semibold text-gray-600 transition hover:border-emerald-500 hover:text-emerald-600"
                 >
-                  {(showHotspotOverlay || isPlacingMark) && marks.map(mark => {
-                    const left = ((mark.x - (mark.width ?? 0) / 2)) * 100;
-                    const top = ((mark.y - (mark.height ?? 0) / 2)) * 100;
-                    const width = (mark.width ?? 0) * 100;
-                    const height = (mark.height ?? 0) * 100;
-                    const textContent = mark.type === 'text'
-                      ? (textFields[mark.id] ?? mark.text ?? '')
-                      : '';
-                    const hasTextContent = mark.type === 'text' && textContent.trim().length > 0;
-                    const imagePreviewUrl = mark.type === 'image'
-                      ? (imageAssets[mark.id]?.previewUrl ?? '')
-                      : '';
-                    const hasImageContent = mark.type === 'image' && imagePreviewUrl.trim().length > 0;
-                    const displayLabel = resolveHotspotDisplayLabel(mark);
-                    return (
-                      <CreativeElement
-                        key={mark.id}
-                        data-hotspot-button="true"
-                        ref={el => {
-                          canvasHotspotRefs.current[mark.id] = el;
-                        }}
-                        type="button"
-                        aria-label={`Edit hotspot ${displayLabel}`}
-                        style={{ left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%` }}
-                        onClick={() => {
-                          lastFocusedHotspotIdRef.current = mark.id;
-                          setActiveHotspotId(mark.id);
-                        }}
-                        onMouseEnter={() => setHoveredMarkId(mark.id)}
-                        onMouseLeave={() => setHoveredMarkId(null)}
-                        label={displayLabel}
-                        elementType={mark.type}
-                        textContent={hasTextContent ? textContent : undefined}
-                        imageSrc={hasImageContent ? imagePreviewUrl : undefined}
-                        isActive={activeHotspotId === mark.id}
-                        isHovered={hoveredMarkId === mark.id}
-                      />
-                    );
-                  })}
-                  {Object.values(generatedAssets).map(asset => {
-                    const mark = marks.find(m => m.id === asset.markId);
-                    if (!mark) return null;
-                    const placement = getAssetPlacementRect(asset, imageBounds.width, imageBounds.height);
-                    if (!placement) return null;
-                    const style: CSSProperties = {
-                      left: `${(placement.centerX / imageBounds.width) * 100}%`,
-                      top: `${(placement.centerY / imageBounds.height) * 100}%`,
-                      width: `${(placement.widthPx / imageBounds.width) * 100}%`,
-                      height: `${(placement.heightPx / imageBounds.height) * 100}%`,
-                      transform: 'translate(-50%, -50%)',
-                      aspectRatio: asset.aspectRatio || undefined,
-                    };
-                    const isActive = activeAssetId === asset.markId;
-                    return (
-                      <div
-                        key={`asset-${asset.markId}`}
-                        className={`absolute pointer-events-auto cursor-grab rounded-xl border ${isActive ? 'border-emerald-500 shadow-lg' : 'border-transparent'} ${isGenerating ? 'cursor-wait opacity-70' : 'hover:border-emerald-400 hover:shadow-lg'}`}
-                        style={style}
-                        onPointerDown={event => handleAssetPointerDown(event, asset)}
-                        onPointerMove={handleAssetPointerMove}
-                        onPointerUp={handleAssetPointerUp}
-                        onPointerCancel={handleAssetPointerUp}
-                      >
-                        <img
-                          src={asset.imageUrl}
-                          alt={`${resolveHotspotDisplayLabel(mark)} overlay`}
-                          className="h-full w-full select-none rounded-lg shadow-sm object-contain"
-                          draggable={false}
-                          style={{ aspectRatio: asset.aspectRatio || undefined }}
-                        />
-                      </div>
-                    );
-                  })}
-                  {draftMark && (
-                    <div
-                      className="pointer-events-none absolute rounded-sm border-2 border-dashed border-emerald-400/80 bg-emerald-400/10"
-                      style={{
-                        left: `${((draftMark.x - (draftMark.width ?? 0) / 2)) * 100}%`,
-                        top: `${((draftMark.y - (draftMark.height ?? 0) / 2)) * 100}%`,
-                        width: `${(draftMark.width ?? 0) * 100}%`,
-                        height: `${(draftMark.height ?? 0) * 100}%`,
-                      }}
-                    />
-                  )}
-                </div>
-              )}
-              {isPlacingMark && (
-                <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/50 p-4 text-center text-white">
-                  Click and drag on the template to outline the new {isPlacingMark} hotspot.
-                </div>
-              )}
+                  Reset view
+                </button>
+              </div>
             </div>
 
-            <aside className="flex flex-col gap-4">
-              <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-sm font-semibold text-gray-800">Hotspot tools</p>
-                  <button
-                    type="button"
-                    onClick={() => setShowHotspotOverlay(prev => !prev)}
-                    className="text-xs font-semibold text-emerald-600 hover:text-emerald-700"
+            <div
+              ref={canvasViewportRef}
+              className="relative flex-1 overflow-hidden bg-slate-200"
+              onPointerDown={handleCanvasPointerDown}
+              onPointerMove={handleCanvasPointerMove}
+              onPointerUp={handleCanvasPointerUp}
+              onPointerCancel={handleCanvasPointerCancel}
+              onWheel={handleCanvasWheel}
+              onDoubleClick={handleCanvasDoubleClick}
+            >
+              <div className="absolute inset-0 flex items-center justify-center">
+                <div
+                  ref={canvasContentRef}
+                  className="pointer-events-none"
+                  style={{ transform: `translate(${canvasOffset.x}px, ${canvasOffset.y}px)` }}
+                >
+                  <div
+                    className="pointer-events-none"
+                    style={{ transform: `scale(${canvasScale})`, transformOrigin: 'center center' }}
                   >
-                    {showHotspotOverlay ? 'Hide overlays' : 'Show overlays'}
-                  </button>
-                </div>
-                <p className="mt-1 text-xs text-gray-500">Add new regions while viewing the base template. Toggle overlays to inspect hotspots on any version.</p>
-                <div className="mt-3 flex flex-col gap-2">
-                  <button
-                    onClick={() => setIsPlacingMark('text')}
-                    className={`w-full rounded-lg border px-3 py-2 text-sm font-semibold transition-colors ${
-                      isPlacingMark === 'text' ? 'border-emerald-500 bg-emerald-500 text-white shadow-sm' : 'border-slate-200 bg-white text-gray-700 hover:bg-slate-100'
-                    }`}
-                  >
-                    Add text hotspot
-                  </button>
-                  <button
-                    onClick={() => setIsPlacingMark('image')}
-                    className={`w-full rounded-lg border px-3 py-2 text-sm font-semibold transition-colors ${
-                      isPlacingMark === 'image' ? 'border-emerald-500 bg-emerald-500 text-white shadow-sm' : 'border-slate-200 bg-white text-gray-700 hover:bg-slate-100'
-                    }`}
-                  >
-                    Add image hotspot
-                  </button>
-                  {isPlacingMark && (
-                    <button onClick={() => setIsPlacingMark(null)} className="text-sm font-medium text-gray-500 hover:text-gray-700">
-                      Cancel placement
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                <p className="text-sm font-semibold text-gray-800">Hotspot status</p>
-                <div className="mt-3 space-y-4">
-                  <div>
-                    <p className="text-xs font-semibold uppercase tracking-wide text-gray-600">Needs input</p>
-                    {missingIncludedMarks.length > 0 ? (
-                      <div className="mt-2 flex flex-wrap gap-2">
-                        {missingIncludedMarks.map(mark => (
-                          <button
-                            key={mark.id}
-                            type="button"
-                            onClick={() => {
-                              setShowHotspotOverlay(true);
-                              lastFocusedHotspotIdRef.current = mark.id;
-                              setActiveHotspotId(mark.id);
-                            }}
-                            className="rounded-full border border-amber-300 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700 hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-300"
-                          >
-                            {resolveHotspotDisplayLabel(mark)}
-                          </button>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="mt-2 text-xs text-gray-500">All included hotspots are ready.</p>
-                    )}
-                  </div>
-                  {ignoredMarks.length > 0 && (
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-wide text-gray-600">Ignored</p>
-                      <div className="mt-2 flex flex-wrap gap-2">
-                        {ignoredMarks.map(mark => (
-                          <button
-                            key={mark.id}
-                            type="button"
-                            onClick={() => {
-                              setShowHotspotOverlay(true);
-                              lastFocusedHotspotIdRef.current = mark.id;
-                              setActiveHotspotId(mark.id);
-                            }}
-                            className="rounded-full border border-slate-300 bg-slate-100 px-3 py-1 text-xs font-semibold text-gray-600 hover:bg-slate-200 focus:outline-none focus:ring-2 focus:ring-slate-300"
-                          >
-                            {resolveHotspotDisplayLabel(mark)}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div className="grid gap-4">
-                <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                  <p className="text-sm font-semibold text-gray-800">Aspect ratio</p>
-                  <p className="mt-1 text-xs text-gray-500">Pick the format for your next render.</p>
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    {['original', '1:1', '16:9', '9:16'].map(option => (
-                      <button
-                        key={option}
-                        type="button"
-                        onClick={() => setAspectRatio(option)}
-                        className={`min-w-[80px] rounded-lg px-4 py-2 text-sm font-semibold transition-colors whitespace-nowrap text-center ${
-                          aspectRatio === option ? 'border border-emerald-500 bg-emerald-100 text-emerald-700 shadow-sm' : 'border border-slate-200 bg-slate-50 text-gray-600 hover:bg-white'
-                        }`}
-                      >
-                        {option === 'original' ? 'Original' : option}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                  <div className="flex items-center justify-between">
-                    <p className="text-sm font-semibold text-gray-800">Brand palette</p>
-                    <button
-                      type="button"
-                      onClick={() => setIsSettingsOpen(true)}
-                      className="text-xs font-semibold text-emerald-600 hover:text-emerald-700"
+                    <div
+                      ref={imagePreviewRef}
+                      onMouseDown={handleCanvasMouseDown}
+                      onMouseMove={handleCanvasMouseMove}
+                      onMouseUp={handleCanvasMouseUp}
+                      onMouseLeave={() => {
+                        if (isDrawingMark) {
+                          cancelDraftMark();
+                        }
+                      }}
+                      className={`pointer-events-auto group relative overflow-hidden rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6 ${isPlacingMark ? 'cursor-crosshair' : ''}`}
                     >
-                      Adjust
-                    </button>
-                  </div>
-                  <div className="mt-3 flex flex-wrap items-center gap-2">
-                    {brandColors.length > 0 ? (
-                      brandColors.map(color => (
-                        <span
-                          key={color}
-                          className="h-7 w-7 rounded-full border border-white shadow-sm"
-                          style={{ backgroundColor: color }}
-                          title={color}
-                        />
-                      ))
-                    ) : (
-                      <p className="text-xs text-gray-500 leading-relaxed">Stick with the template colors or tap Adjust to choose your brand palette.</p>
-                    )}
-                  </div>
-                  {isSettingsOpen && (
-                    <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4 shadow-lg">
-                      <ColorPaletteSelector
-                        selectedPalette={brandColors}
-                        onPaletteChange={palette => {
-                          setBrandColors(palette);
-                          setIsSettingsOpen(false);
-                        }}
-                        userBrandColors={appUser?.brandColors}
+                      <img
+                        ref={imageElementRef}
+                        src={activeImageUrl}
+                        alt="Creative Preview"
+                        className="mx-auto h-auto max-h-[70vh] w-full max-w-4xl object-contain"
+                        onLoad={updateImageBounds}
                       />
+                      <div className="absolute right-4 top-4 rounded-full bg-black/50 px-2 py-1 text-xs text-white">
+                        {activeIndex === 0 ? 'Template' : `Version ${activeIndex}`}
+                      </div>
+                      {activeImage && (
+                        <div className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-2xl bg-black/60 opacity-0 transition-opacity group-hover:opacity-100">
+                          <button
+                            onClick={handleDownload}
+                            disabled={!canDownloadActiveImage}
+                            className={`pointer-events-auto flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold transition ${
+                              canDownloadActiveImage
+                                ? 'bg-white text-black hover:bg-white/90'
+                                : 'cursor-not-allowed bg-white/70 text-gray-500'
+                            }`}
+                          >
+                            <DownloadIcon className="h-4 w-4" /> Download
+                          </button>
+                        </div>
+                      )}
+                      {imageBounds.width > 0 && imageBounds.height > 0 && (
+                        <div
+                          className={`absolute ${showHotspotOverlay || isPlacingMark ? '' : 'pointer-events-none'}`}
+                          style={{
+                            left: imageBounds.left,
+                            top: imageBounds.top,
+                            width: imageBounds.width,
+                            height: imageBounds.height,
+                          }}
+                        >
+                          {(showHotspotOverlay || isPlacingMark) && marks.map(mark => {
+                            const left = ((mark.x - (mark.width ?? 0) / 2)) * 100;
+                            const top = ((mark.y - (mark.height ?? 0) / 2)) * 100;
+                            const width = (mark.width ?? 0) * 100;
+                            const height = (mark.height ?? 0) * 100;
+                            const textContent = mark.type === 'text'
+                              ? (textFields[mark.id] ?? mark.text ?? '')
+                              : '';
+                            const hasTextContent = mark.type === 'text' && textContent.trim().length > 0;
+                            const imagePreviewUrl = mark.type === 'image'
+                              ? (imageAssets[mark.id]?.previewUrl ?? '')
+                              : '';
+                            const hasImageContent = mark.type === 'image' && imagePreviewUrl.trim().length > 0;
+                            const displayLabel = resolveHotspotDisplayLabel(mark);
+                            return (
+                              <CreativeElement
+                                key={mark.id}
+                                data-hotspot-button="true"
+                                ref={el => {
+                                  canvasHotspotRefs.current[mark.id] = el;
+                                }}
+                                type="button"
+                                aria-label={`Edit hotspot ${displayLabel}`}
+                                style={{ left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%` }}
+                                onClick={() => {
+                                  lastFocusedHotspotIdRef.current = mark.id;
+                                  setActiveHotspotId(mark.id);
+                                }}
+                                onMouseEnter={() => setHoveredMarkId(mark.id)}
+                                onMouseLeave={() => setHoveredMarkId(null)}
+                                label={displayLabel}
+                                elementType={mark.type}
+                                textContent={hasTextContent ? textContent : undefined}
+                                imageSrc={hasImageContent ? imagePreviewUrl : undefined}
+                                isActive={activeHotspotId === mark.id}
+                                isHovered={hoveredMarkId === mark.id}
+                              />
+                            );
+                          })}
+                          {Object.values(generatedAssets).map(asset => {
+                            const mark = marks.find(m => m.id === asset.markId);
+                            if (!mark) return null;
+                            const placement = getAssetPlacementRect(asset, imageBounds.width, imageBounds.height);
+                            if (!placement) return null;
+                            const style: CSSProperties = {
+                              left: `${(placement.centerX / imageBounds.width) * 100}%`,
+                              top: `${(placement.centerY / imageBounds.height) * 100}%`,
+                              width: `${(placement.widthPx / imageBounds.width) * 100}%`,
+                              height: `${(placement.heightPx / imageBounds.height) * 100}%`,
+                              transform: 'translate(-50%, -50%)',
+                              aspectRatio: asset.aspectRatio || undefined,
+                            };
+                            const isActive = activeAssetId === asset.markId;
+                            return (
+                              <div
+                                key={`asset-${asset.markId}`}
+                                className={`absolute pointer-events-auto cursor-grab rounded-xl border ${isActive ? 'border-emerald-500 shadow-lg' : 'border-transparent'} ${isGenerating ? 'cursor-wait opacity-70' : 'hover:border-emerald-400 hover:shadow-lg'}`}
+                                style={style}
+                                onPointerDown={event => handleAssetPointerDown(event, asset)}
+                                onPointerMove={handleAssetPointerMove}
+                                onPointerUp={handleAssetPointerUp}
+                                onPointerCancel={handleAssetPointerUp}
+                              >
+                                <img
+                                  src={asset.imageUrl}
+                                  alt={`${resolveHotspotDisplayLabel(mark)} overlay`}
+                                  className="h-full w-full select-none rounded-lg object-contain shadow-sm"
+                                  draggable={false}
+                                  style={{ aspectRatio: asset.aspectRatio || undefined }}
+                                />
+                              </div>
+                            );
+                          })}
+                          {draftMark && (
+                            <div
+                              className="pointer-events-none absolute rounded-sm border-2 border-dashed border-emerald-400/80 bg-emerald-400/10"
+                              style={{
+                                left: `${((draftMark.x - (draftMark.width ?? 0) / 2)) * 100}%`,
+                                top: `${((draftMark.y - (draftMark.height ?? 0) / 2)) * 100}%`,
+                                width: `${(draftMark.width ?? 0) * 100}%`,
+                                height: `${(draftMark.height ?? 0) * 100}%`,
+                              }}
+                            />
+                          )}
+                        </div>
+                      )}
+                      {isPlacingMark && (
+                        <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/50 p-4 text-center text-white">
+                          Click and drag on the template to outline the new {isPlacingMark} hotspot.
+                        </div>
+                      )}
                     </div>
-                  )}
+                  </div>
                 </div>
               </div>
-            </aside>
-          </div>
+              <div className="pointer-events-none absolute bottom-4 right-4 hidden rounded-full bg-black/60 px-3 py-1 text-xs font-semibold text-white sm:block">
+                {scaleDisplay}
+              </div>
+            </div>
+
+            <div className="border-t border-slate-200 bg-white px-4 py-4 text-xs text-gray-500 sm:hidden">
+              {marks.length} hotspot{marks.length === 1 ? '' : 's'} detected · {includedMarks.length} included · {missingIncludedMarksCount} need input
+            </div>
+            <div className="border-t border-slate-200 bg-white px-4 py-6 lg:hidden">
+              {versionsPanel}
+            </div>
+            <div className="border-t border-slate-200 bg-white px-4 py-6 lg:hidden">
+              {inspectorPanel}
+            </div>
+          </main>
+
+          <aside className="hidden h-full w-80 flex-shrink-0 border-l border-slate-200 bg-white xl:flex">
+            <div className="flex h-full w-full flex-col overflow-hidden">
+              <div className="border-b border-slate-200 px-4 py-3">
+                <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Inspector</p>
+              </div>
+              <div className="flex-1 overflow-y-auto px-4 py-6">
+                {inspectorPanel}
+              </div>
+            </div>
+          </aside>
         </div>
       </div>
       {renderFloatingActions()}
       {renderChatDrawer()}
       {mentionSuggestions.length > 0 && mentionAnchor && (
         <div className="fixed z-50" style={{ top: mentionAnchor.y, left: mentionAnchor.x }}>
-            <div className="bg-white border border-slate-200 rounded-lg shadow-lg w-48">
-                {mentionSuggestions.map(token => (
-                    <button
-                        key={token.id}
-                        onClick={() => insertMention(token)}
-                        className="w-full text-left px-3 py-2 hover:bg-emerald-50 flex flex-col"
-                    >
-                        <span className="text-sm font-semibold text-gray-800">@{token.id}</span>
-                        <span className="text-xs text-gray-500">{token.label}</span>
-                    </button>
-                ))}
-            </div>
+          <div className="w-48 rounded-lg border border-slate-200 bg-white shadow-lg">
+            {mentionSuggestions.map(token => (
+              <button
+                key={token.id}
+                onClick={() => insertMention(token)}
+                className="flex w-full flex-col px-3 py-2 text-left hover:bg-emerald-50"
+              >
+                <span className="text-sm font-semibold text-gray-800">@{token.id}</span>
+                <span className="text-xs text-gray-500">{token.label}</span>
+              </button>
+            ))}
+          </div>
         </div>
       )}
       {invalidMentions.length > 0 && (
-        <div className="fixed bottom-24 right-4 z-50 bg-red-600 text-white text-sm px-4 py-2 rounded-full shadow-lg">
-            Unknown hotspots: {invalidMentions.join(', ')}
+        <div className="fixed bottom-24 right-4 z-50 rounded-full bg-red-600 px-4 py-2 text-sm text-white shadow-lg">
+          Unknown hotspots: {invalidMentions.join(', ')}
         </div>
       )}
       {renderGenerationConfirm()}
@@ -2892,7 +3134,6 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     </div>
   );
 };
-
 
 const FileUploader = ({ onFileUpload, title, asset, onClear }: { onFileUpload: (asset: BrandAsset) => void; title: string; asset: BrandAsset | null; onClear?: () => void; }) => {
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {

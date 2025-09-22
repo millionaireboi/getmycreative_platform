@@ -173,6 +173,15 @@ export const EyeIcon = ({ className }: { className?: string }) => (
     </svg>
 );
 
+export const EyeOffIcon = ({ className }: { className?: string }) => (
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`block ${className || ''}`}>
+        <path d="M17.94 17.94A10.44 10.44 0 0 1 12 20c-7 0-11-8-11-8a18.53 18.53 0 0 1 5.07-5.96"></path>
+        <path d="M1 1l22 22"></path>
+        <path d="M9.88 9.88A3 3 0 0 0 12 15a3 3 0 0 0 2.12-.88"></path>
+        <path d="M14.12 9.88 20.94 16c.69-.74 1.32-1.55 1.94-2.45 0 0-4-8-11-8a10.39 10.39 0 0 0-2.12.22"></path>
+    </svg>
+);
+
 export const DollarSignIcon = ({ className }: { className?: string }) => (
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`block ${className || ''}`}>
         <line x1="12" y1="1" x2="12" y2="23"></line>
@@ -196,6 +205,14 @@ export const FileTextIcon = ({ className }: { className?: string }) => (
         <line x1="16" y1="13" x2="8" y2="13"></line>
         <line x1="16" y1="17" x2="8" y2="17"></line>
         <polyline points="10 9 9 9 8 9"></polyline>
+    </svg>
+);
+
+export const ImageIcon = ({ className }: { className?: string }) => (
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`block ${className || ''}`}>
+        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+        <circle cx="8.5" cy="8.5" r="1.5"></circle>
+        <path d="m21 15-4-4a2 2 0 0 0-2.828 0l-6.172 6"></path>
     </svg>
 );
 
