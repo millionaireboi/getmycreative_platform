@@ -1,8 +1,9 @@
-import { useState, useCallback, useEffect, ChangeEvent, FormEvent, useRef, MouseEvent, useMemo, MutableRefObject } from 'react';
-import { UITemplate, BrandAsset, GeneratedImage, Mark, ChatMessage } from '../types.ts';
-import { generateCreative, editCreativeWithChat, ChatEditOptions } from '../services/geminiService.ts';
+import { useState, useCallback, useEffect, ChangeEvent, FormEvent, useRef, MouseEvent, useMemo, MutableRefObject, CSSProperties } from 'react';
+import { removeBackground } from '@imgly/background-removal';
+import { UITemplate, BrandAsset, GeneratedImage, Mark, ChatMessage, TemplateStyleSnapshot } from '../types.ts';
+import { generateCreative, editCreativeWithChat, ChatEditOptions, generateHotspotAsset, generateTemplateStyleSnapshot } from '../services/geminiService.ts';
 import { fileToBase64, downloadImage, imageUrlToBase64, base64ToBlob } from '../utils/fileUtils.ts';
-import { SparklesIcon, ArrowLeftIcon, DownloadIcon, PaperclipIcon, SendIcon, PaletteIcon, XIcon, UploadCloudIcon, TrashIcon, EditIcon } from './icons.tsx';
+import { SparklesIcon, ArrowLeftIcon, DownloadIcon, PaperclipIcon, SendIcon, PaletteIcon, XIcon, UploadCloudIcon, EditIcon } from './icons.tsx';
 import CreativeElement from './CreativeElement.tsx';
 
 import { BRAND_PALETTES } from '../constants.ts';
@@ -91,6 +92,210 @@ const ColorPaletteSelector = ({ selectedPalette, onPaletteChange, userBrandColor
     );
 };
 
+interface HotspotAssetPlacement {
+  markId: string;
+  label: string;
+  base64: string;
+  mimeType: string;
+  hasAlpha: boolean;
+  imageUrl: string;
+  aspectRatio: number;
+  center: { x: number; y: number }; // normalized to the full canvas (0-1)
+  scale: number; // multiplier on baseWidthPercent
+  baseWidthPercent: number; // relative to canvas width
+  lockAspect?: boolean;
+  signature: string;
+  origin: 'ai-generated' | 'user-upload';
+}
+
+type RGB = { r: number; g: number; b: number };
+type HistogramEntry = { r: number; g: number; b: number; count: number };
+
+const loadImageElement = (src: string): Promise<HTMLImageElement> =>
+  new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+
+const getPixel = (buffer: Uint8ClampedArray, width: number, x: number, y: number) => {
+  const index = (y * width + x) * 4;
+  return {
+    r: buffer[index],
+    g: buffer[index + 1],
+    b: buffer[index + 2],
+    a: buffer[index + 3],
+  };
+};
+
+const hasAnyTransparency = (buffer: Uint8ClampedArray) => {
+  for (let i = 3; i < buffer.length; i += 4) {
+    if (buffer[i] < 250) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const colorDistance = (pixel: RGB, reference: RGB) => {
+  const dr = pixel.r - reference.r;
+  const dg = pixel.g - reference.g;
+  const db = pixel.b - reference.b;
+  return Math.sqrt(dr * dr + dg * dg + db * db);
+};
+
+const quantize = (value: number, step = 16) => Math.round(value / step) * step;
+
+const dominantBorderColor = (buffer: Uint8ClampedArray, width: number, height: number): RGB | null => {
+  if (width === 0 || height === 0) {
+    return null;
+  }
+
+  const histogram = new Map<string, HistogramEntry>();
+  let totalSamples = 0;
+  const stepX = Math.max(1, Math.floor(width / 25));
+  const stepY = Math.max(1, Math.floor(height / 25));
+
+  const addSample = (x: number, y: number) => {
+    const { r, g, b } = getPixel(buffer, width, x, y);
+    const key = `${quantize(r)}-${quantize(g)}-${quantize(b)}`;
+    const existing = histogram.get(key);
+    const entry: HistogramEntry = existing ?? { r: 0, g: 0, b: 0, count: 0 };
+    if (!existing) {
+      histogram.set(key, entry);
+    }
+    entry.r += r;
+    entry.g += g;
+    entry.b += b;
+    entry.count += 1;
+    totalSamples += 1;
+  };
+
+  for (let x = 0; x < width; x += stepX) {
+    addSample(x, 0);
+    if (height > 1) addSample(x, height - 1);
+  }
+  for (let y = 1; y < height - 1; y += stepY) {
+    addSample(0, y);
+    if (width > 1) addSample(width - 1, y);
+  }
+
+  let topBin: HistogramEntry | null = null;
+  histogram.forEach(entry => {
+    if (!topBin || entry.count > topBin.count) {
+      topBin = entry;
+    }
+  });
+
+  if (!topBin || totalSamples === 0) {
+    return null;
+  }
+
+  const resolvedTopBin: HistogramEntry = topBin;
+
+  const dominance = resolvedTopBin.count / totalSamples;
+  if (dominance < 0.55) {
+    return null;
+  }
+
+  return {
+    r: Math.round(resolvedTopBin.r / resolvedTopBin.count),
+    g: Math.round(resolvedTopBin.g / resolvedTopBin.count),
+    b: Math.round(resolvedTopBin.b / resolvedTopBin.count),
+  };
+};
+
+const stripSolidBackground = (
+  buffer: Uint8ClampedArray,
+  width: number,
+  height: number,
+  background: RGB,
+  tolerance = 20
+) => {
+  let updated = false;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const index = (y * width + x) * 4;
+      const pixel = { r: buffer[index], g: buffer[index + 1], b: buffer[index + 2] };
+      if (colorDistance(pixel, background) <= tolerance) {
+        if (buffer[index + 3] !== 0) {
+          buffer[index + 3] = 0;
+          updated = true;
+        }
+      }
+    }
+  }
+  return updated;
+};
+
+const prepareOverlayAsset = async (
+  asset: { base64: string; mimeType: string; enforceTransparency: boolean }
+): Promise<{ base64: string; mimeType: string; width: number; height: number; hasAlpha: boolean; usedMatting: boolean }> => {
+  const dataUrl = `data:${asset.mimeType};base64,${asset.base64}`;
+  const image = await loadImageElement(dataUrl);
+  const width = image.naturalWidth || image.width;
+  const height = image.naturalHeight || image.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) {
+    throw new Error('Unable to initialise canvas for overlay asset.');
+  }
+
+  ctx.drawImage(image, 0, 0, width, height);
+  const imageData = ctx.getImageData(0, 0, width, height);
+  const buffer = imageData.data;
+  let hasAlpha = hasAnyTransparency(buffer);
+  let usedMatting = false;
+
+  if (!hasAlpha && asset.enforceTransparency) {
+    try {
+      const transparentBlob = await removeBackground(dataUrl, {
+        output: { format: 'image/png' },
+      });
+      const mimeType = transparentBlob.type || 'image/png';
+      const transparentFile = new File([transparentBlob], 'overlay.png', { type: mimeType });
+      const cleanedBase64 = await fileToBase64(transparentFile);
+
+      return {
+        base64: cleanedBase64,
+        mimeType,
+        width,
+        height,
+        hasAlpha: true,
+        usedMatting: true,
+      };
+    } catch (error) {
+      console.error('Background removal failed with @imgly/background-removal:', error);
+    }
+
+    const background = dominantBorderColor(buffer, width, height);
+    if (background) {
+      usedMatting = stripSolidBackground(buffer, width, height, background, 22);
+      if (usedMatting) {
+        ctx.putImageData(imageData, 0, 0);
+        hasAlpha = hasAnyTransparency(buffer);
+      }
+    }
+  }
+
+  // Export as PNG to normalise output regardless of input type.
+  const exportDataUrl = canvas.toDataURL('image/png');
+  const cleanedBase64 = exportDataUrl.split(',')[1] ?? exportDataUrl;
+
+  return {
+    base64: cleanedBase64,
+    mimeType: 'image/png',
+    width,
+    height,
+    hasAlpha: hasAlpha,
+    usedMatting,
+  };
+};
+
 interface EditorViewProps {
   project: Project | null;
   pendingTemplate: UITemplate | null;
@@ -165,6 +370,11 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [brandColors, setBrandColors] = useState<string[]>(appUser?.brandColors ?? []);
   const [aspectRatio, setAspectRatio] = useState('original');
+  const projectStyleSnapshot = (project && (project as unknown as { styleSnapshot?: TemplateStyleSnapshot }).styleSnapshot) ?? null;
+  const [styleSnapshot, setStyleSnapshot] = useState<TemplateStyleSnapshot | null>(projectStyleSnapshot ?? pendingTemplate?.styleSnapshot ?? null);
+  const [generatedAssets, setGeneratedAssets] = useState<Record<string, HotspotAssetPlacement>>({});
+  const [activeAssetId, setActiveAssetId] = useState<string | null>(null);
+  const [isRenderingComposite, setIsRenderingComposite] = useState(false);
 
   const [isPlacingMark, setIsPlacingMark] = useState<'text' | 'image' | null>(null);
   const [hoveredMarkId, setHoveredMarkId] = useState<string | null>(null);
@@ -186,6 +396,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     projectId: project?.id ?? null,
     templateId: project ? null : (pendingTemplate?.id ?? null)
   });
+  const baseStyleImageRef = useRef<string>(history[0]?.imageUrl ?? initialTemplateImageUrl);
+  const styleSnapshotPromiseRef = useRef<Promise<TemplateStyleSnapshot> | null>(null);
 
   const originalMarks = useMemo(() => project?.initialMarks ?? pendingTemplate?.initialMarks ?? [], [project, pendingTemplate]);
   const originalMarksMap = useMemo(() => {
@@ -284,6 +496,125 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         return map;
     });
     setImageAssets({});
+    setGeneratedAssets({});
+  }, []);
+
+  const toDataUrl = (base64: string, mimeType: string) => `data:${mimeType};base64,${base64}`;
+
+  const loadImageDimensions = (base64: string, mimeType: string): Promise<{ width: number; height: number }> =>
+    new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+      img.onerror = reject;
+      img.src = toDataUrl(base64, mimeType);
+    });
+
+  const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+  const ensureStyleSnapshot = useCallback(async (): Promise<TemplateStyleSnapshot> => {
+    if (styleSnapshot) {
+      return styleSnapshot;
+    }
+    if (styleSnapshotPromiseRef.current) {
+      return styleSnapshotPromiseRef.current;
+    }
+
+    styleSnapshotPromiseRef.current = (async () => {
+      const sourceUrl = baseStyleImageRef.current || templateImageUrl;
+      const { base64, mimeType } = await imageUrlToBase64(sourceUrl);
+      const snapshot = await generateTemplateStyleSnapshot(base64, mimeType);
+      setStyleSnapshot(snapshot);
+      styleSnapshotPromiseRef.current = null;
+      return snapshot;
+    })().catch(error => {
+      styleSnapshotPromiseRef.current = null;
+      throw error;
+    });
+
+    return styleSnapshotPromiseRef.current;
+  }, [styleSnapshot, templateImageUrl]);
+
+  const computeAspectRatioHint = (mark: Mark): string | undefined => {
+    const width = mark.width ?? mark.scale ?? 0;
+    const height = mark.height ?? mark.scale ?? 0;
+    if (width <= 0 || height <= 0) return undefined;
+    const ratio = width / height;
+    if (!Number.isFinite(ratio) || ratio <= 0) return undefined;
+    if (ratio >= 1) {
+      return `${ratio.toFixed(2)}:1`;
+    }
+    return `1:${(1 / ratio).toFixed(2)}`;
+  };
+
+  const includedMarks = useMemo(() => marks.filter(mark => enabledMarks[mark.id]), [marks, enabledMarks]);
+  const ignoredMarks = useMemo(() => marks.filter(mark => !enabledMarks[mark.id]), [marks, enabledMarks]);
+
+  const readyIncludedMarks = useMemo(() => includedMarks.filter(mark => canEnableMark(mark.id)), [includedMarks, canEnableMark]);
+
+  const missingIncludedMarks = useMemo(() => {
+    const readyIds = new Set(readyIncludedMarks.map(mark => mark.id));
+    return includedMarks.filter(mark => !readyIds.has(mark.id));
+  }, [includedMarks, readyIncludedMarks]);
+
+  const missingIncludedMarksCount = Math.max(0, includedMarks.length - readyIncludedMarks.length);
+
+  const buildHotspotSummary = (mark: Mark): string => {
+    const widthPercent = Math.round((mark.width ?? mark.scale ?? 0) * 100);
+    const heightPercent = Math.round((mark.height ?? mark.scale ?? 0) * 100);
+    const centerX = Math.round(mark.x * 100);
+    const centerY = Math.round(mark.y * 100);
+    return `Hotspot is roughly ${widthPercent}% of the canvas width by ${heightPercent}% of the height, centered around ${centerX}% across and ${centerY}% down.`;
+  };
+
+  const getAssetDisplayMetrics = (asset: HotspotAssetPlacement) => {
+    const widthPercent = clamp(asset.baseWidthPercent * asset.scale, 2, 400);
+    let heightPercent = widthPercent / (asset.aspectRatio || 1);
+    if (!Number.isFinite(heightPercent) || heightPercent <= 0) {
+      heightPercent = widthPercent;
+    }
+    return { widthPercent, heightPercent };
+  };
+
+  const computeInitialWidthPercent = (mark: Mark, scaleHint = 0.85) => {
+    const normalized = mark.width ?? mark.scale ?? 0;
+    if (normalized > 0) {
+      return clamp(normalized * 100 * scaleHint, 5, 100);
+    }
+    return clamp(30 * scaleHint, 5, 80);
+  };
+
+  const getAssetSignature = useCallback((mark: Mark): string | null => {
+    if (mark.type === 'text') {
+      const text = (textFields[mark.id] ?? '').trim();
+      return text ? `text:${text}` : null;
+    }
+    const mode = imageModes[mark.id] || 'upload';
+    if (mode === 'upload') {
+      const asset = imageAssets[mark.id];
+      return asset?.base64 ? `upload:${asset.base64}` : null;
+    }
+    const prompt = (imagePrompts[mark.id] ?? '').trim();
+    return prompt ? `describe:${prompt}` : null;
+  }, [textFields, imageModes, imageAssets, imagePrompts]);
+
+  const updateAssetPlacement = useCallback((markId: string, updates: Partial<HotspotAssetPlacement> | ((current: HotspotAssetPlacement) => Partial<HotspotAssetPlacement> | null)) => {
+    setGeneratedAssets(prev => {
+      const current = prev[markId];
+      if (!current) return prev;
+      const nextPatch = typeof updates === 'function' ? updates(current) : updates;
+      if (!nextPatch) return prev;
+      return { ...prev, [markId]: { ...current, ...nextPatch } };
+    });
+  }, []);
+
+  const removeAsset = useCallback((markId: string) => {
+    setGeneratedAssets(prev => {
+      if (!prev[markId]) return prev;
+      const next = { ...prev };
+      delete next[markId];
+      return next;
+    });
   }, []);
 
   const mentionTokens = useMemo(() => {
@@ -294,6 +625,30 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         isIncluded: !!enabledMarks[mark.id]
     }));
   }, [marks, enabledMarks]);
+
+  useEffect(() => {
+    setGeneratedAssets(prev => {
+      let changed = false;
+      const next = { ...prev } as Record<string, HotspotAssetPlacement>;
+      Object.values(prev).forEach(asset => {
+        const mark = marks.find(m => m.id === asset.markId);
+        if (!mark) {
+          delete next[asset.markId];
+          changed = true;
+          return;
+        }
+        if (!mark.isNew) {
+          return;
+        }
+        const signature = getAssetSignature(mark);
+        if (!signature || signature !== asset.signature) {
+          delete next[asset.markId];
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [marks, getAssetSignature]);
 
   const [mentionSuggestions, setMentionSuggestions] = useState<{ id: string; label: string; type: string; isIncluded: boolean }[]>([]);
   const [, setMentionQuery] = useState('');
@@ -321,6 +676,65 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const drawerLabelInputRef = useRef<HTMLInputElement | null>(null);
   const drawerIncludeButtonRef = useRef<HTMLButtonElement | null>(null);
   const drawerTextAreaRef = useRef<HTMLTextAreaElement | null>(null);
+  const assetDragRef = useRef<{
+    assetId: string;
+    pointerId: number;
+    containerRect: { left: number; top: number; width: number; height: number };
+    startCenter: { x: number; y: number };
+    startPointer: { x: number; y: number };
+    widthPercent: number;
+    heightPercent: number;
+  } | null>(null);
+
+  const handleAssetPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>, asset: HotspotAssetPlacement) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (imageBounds.width <= 0 || imageBounds.height <= 0) return;
+    setActiveAssetId(asset.markId);
+    const { widthPercent, heightPercent } = getAssetDisplayMetrics(asset);
+    assetDragRef.current = {
+      assetId: asset.markId,
+      pointerId: event.pointerId,
+      containerRect: { ...imageBounds },
+      startCenter: { ...asset.center },
+      startPointer: { x: event.clientX, y: event.clientY },
+      widthPercent,
+      heightPercent,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }, [getAssetDisplayMetrics, imageBounds]);
+
+  const handleAssetPointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = assetDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const { containerRect, startPointer, startCenter, widthPercent, heightPercent, assetId } = drag;
+    if (containerRect.width === 0 || containerRect.height === 0) {
+      return;
+    }
+    const deltaXFraction = (event.clientX - startPointer.x) / containerRect.width;
+    const deltaYFraction = (event.clientY - startPointer.y) / containerRect.height;
+    const widthFraction = clamp(widthPercent / 100, 0, 4);
+    const heightFraction = clamp(heightPercent / 100, 0, 4);
+    const minX = widthFraction / 2;
+    const maxX = 1 - minX;
+    const minY = heightFraction / 2;
+    const maxY = 1 - minY;
+    const nextCenterX = clamp(startCenter.x + deltaXFraction, minX, maxX);
+    const nextCenterY = clamp(startCenter.y + deltaYFraction, minY, maxY);
+    updateAssetPlacement(assetId, { center: { x: nextCenterX, y: nextCenterY } });
+  }, [updateAssetPlacement]);
+
+  const handleAssetPointerUp = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = assetDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.stopPropagation();
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    assetDragRef.current = null;
+  }, []);
 
   const updateImageBounds = useCallback(() => {
     if (!imagePreviewRef.current || !imageElementRef.current) return;
@@ -336,7 +750,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
   const activeImage = history[activeIndex];
   const activeImageUrl = activeImage?.imageUrl || templateImageUrl;
-  const canDownloadActiveImage = activeIndex > 0 && !!activeImage;
+  const overlaysPresent = Object.keys(generatedAssets).length > 0;
+  const canDownloadActiveImage = !!activeImage && (activeIndex > 0 || overlaysPresent);
   const activeMark = useMemo(() => {
     if (!activeHotspotId) return null;
     return marks.find(m => m.id === activeHotspotId) || null;
@@ -550,55 +965,256 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setIsChatDrawerOpen(true);
     setChatMessages(prev => prev.filter(m => m.type !== 'error'));
 
-    const userMessage: ChatMessage = {
-        id: `msg-${Date.now()}`,
-        role: 'user',
+    const readyMarks = readyIncludedMarks;
+    if (readyMarks.length === 0) {
+      const infoMessage: ChatMessage = {
+        id: `msg-ai-${Date.now()}`,
+        role: 'assistant',
         type: 'text',
-        text: 'Generate the creative with the hotspots I selected.'
+        text: 'Select and fill at least one hotspot before generating.',
+      };
+      setChatMessages(prev => [...prev, infoMessage]);
+      setIsGenerating(false);
+      return;
+    }
+
+    const userMessage: ChatMessage = {
+      id: `msg-${Date.now()}`,
+      role: 'user',
+      type: 'text',
+      text: 'Generate the creative with the hotspots I selected.'
     };
     setChatMessages(prev => {
-        const withoutTip = prev.filter(m => m.id !== 'msg-tip');
-        return [...withoutTip, userMessage];
+      const withoutTip = prev.filter(m => m.id !== 'msg-tip');
+      return [...withoutTip, userMessage];
     });
 
     try {
       const { base64: templateBase64, mimeType: templateMimeType, width: templateWidth, height: templateHeight } = await imageUrlToBase64(templateImageUrl);
-      
-      const resultBase64 = await generateCreative(
-        templateBase64,
-        templateMimeType,
-        basePrompt,
-        textFields,
-        imageAssets,
-        imagePrompts,
-        imageModes,
-        enabledMarks,
-        aspectRatio,
-        marks,
-        originalMarks,
-        { width: templateWidth, height: templateHeight }
-      );
 
-      const imageBlob = base64ToBlob(resultBase64, 'image/png');
-      const newImageUrl = await uploadFileToStorage(imageBlob, `projects/${appUser.id}/generated`);
+      const existingMarks = readyMarks.filter(mark => !mark.isNew);
 
-      const newCreative: GeneratedImage = {
-        id: `gen-${Date.now()}`,
-        imageUrl: newImageUrl,
-        prompt: basePrompt,
-      };
+      const overlayTextMarks = readyMarks.filter(mark => {
+        if (mark.type !== 'text') {
+          return false;
+        }
+        const nextText = (textFields[mark.id] ?? '').trim();
+        if (!nextText) {
+          return false;
+        }
+        if (mark.isNew) {
+          return true;
+        }
+        const originalTrimmed = (originalMarksMap[mark.id]?.text ?? '').trim();
+        return !originalTrimmed || originalTrimmed !== nextText;
+      });
+      const overlayTextMarkIdSet = new Set(overlayTextMarks.map(mark => mark.id));
+      const existingOverlayTextMarkIds = overlayTextMarks
+        .filter(mark => !mark.isNew)
+        .map(mark => mark.id);
 
-      const updatedHistory = [...history, newCreative];
-      setHistory(updatedHistory);
-      setActiveIndex(updatedHistory.length - 1);
-      await ensureProjectPersisted(updatedHistory);
-      
-      const assistantMessage: ChatMessage = {
-          id: `msg-ai-${Date.now()}`, role: 'assistant', type: 'text',
-          text: "Here's your first version! How does it look? You can ask for changes below."
+      const updates: string[] = [];
+      let latestBaseImageUrl = templateImageUrl;
+
+      if (existingMarks.length > 0) {
+        const enabledForGeneration: Record<string, boolean> = {};
+        const existingIds = new Set(existingMarks.map(mark => mark.id));
+        marks.forEach(mark => {
+          enabledForGeneration[mark.id] = existingIds.has(mark.id);
+        });
+
+        const resultBase64 = await generateCreative(
+          templateBase64,
+          templateMimeType,
+          basePrompt,
+          textFields,
+          imageAssets,
+          imagePrompts,
+          imageModes,
+          enabledForGeneration,
+          aspectRatio,
+          marks,
+          originalMarks,
+          {
+            canvasDimensions: { width: templateWidth, height: templateHeight },
+            overlayTextMarkIds: existingOverlayTextMarkIds,
+          }
+        );
+
+        const imageBlob = base64ToBlob(resultBase64, 'image/png');
+        const newImageUrl = await uploadFileToStorage(imageBlob, `projects/${appUser.id}/generated`);
+
+        const newCreative: GeneratedImage = {
+          id: `gen-${Date.now()}`,
+          imageUrl: newImageUrl,
+          prompt: basePrompt,
+        };
+
+        const updatedHistory = [...history, newCreative];
+        setHistory(updatedHistory);
+        setActiveIndex(updatedHistory.length - 1);
+        await ensureProjectPersisted(updatedHistory);
+        latestBaseImageUrl = newImageUrl;
+
+        updates.push(existingMarks.length > 1
+          ? 'Updated the template with multiple hotspot edits.'
+          : `Updated ${resolveHotspotDisplayLabel(existingMarks[0])}.`);
       }
+
+      const marksNeedingAssets = readyMarks.filter(mark => {
+        const signature = getAssetSignature(mark);
+        if (!signature) {
+          return false;
+        }
+
+        if (mark.type === 'text') {
+          if (!overlayTextMarkIdSet.has(mark.id)) {
+            return false;
+          }
+        } else if (!mark.isNew) {
+          return false;
+        }
+
+        const existingPlacement = generatedAssets[mark.id];
+        return !existingPlacement || existingPlacement.signature !== signature;
+      });
+
+      if (marksNeedingAssets.length > 0) {
+        const snapshot = await ensureStyleSnapshot();
+        const placementUpdates: Record<string, HotspotAssetPlacement> = {};
+
+        for (const mark of marksNeedingAssets) {
+          const signature = getAssetSignature(mark);
+          if (!signature) {
+            continue;
+          }
+
+          if (mark.type === 'text') {
+            const textContent = (textFields[mark.id] ?? '').trim();
+            const asset = await generateHotspotAsset({
+              styleSnapshot: snapshot,
+              intent: 'text',
+              hotspotLabel: resolveHotspotDisplayLabel(mark),
+              textContent,
+              placementSummary: buildHotspotSummary(mark),
+              brandColors: brandColors.length > 0 ? brandColors : undefined,
+              aspectRatioHint: computeAspectRatioHint(mark),
+              sizeHint: {
+                widthPx: Math.round((mark.width ?? mark.scale ?? 0) * templateWidth),
+                heightPx: Math.round((mark.height ?? mark.scale ?? 0) * templateHeight),
+              },
+            });
+            const prepared = await prepareOverlayAsset({
+              base64: asset.base64,
+              mimeType: asset.mimeType,
+              enforceTransparency: true,
+            });
+
+            if (!prepared.hasAlpha) {
+              throw new Error(`Unable to create a transparent overlay for ${resolveHotspotDisplayLabel(mark)}. Try adjusting the prompt or retry.`);
+            }
+
+            placementUpdates[mark.id] = {
+              markId: mark.id,
+              label: resolveHotspotDisplayLabel(mark),
+              base64: prepared.base64,
+              mimeType: prepared.mimeType,
+              hasAlpha: prepared.hasAlpha,
+              imageUrl: toDataUrl(prepared.base64, prepared.mimeType),
+              aspectRatio: prepared.width > 0 && prepared.height > 0 ? prepared.width / prepared.height : 1,
+              center: { x: clamp(mark.x, 0, 1), y: clamp(mark.y, 0, 1) },
+              scale: 1,
+              baseWidthPercent: computeInitialWidthPercent(mark, 0.9),
+              signature,
+              origin: 'ai-generated',
+            };
+            continue;
+          }
+
+          const mode = imageModes[mark.id] || 'upload';
+          if (mode === 'upload') {
+            const asset = imageAssets[mark.id];
+            if (!asset) {
+              continue;
+            }
+            const dims = await loadImageDimensions(asset.base64, asset.file.type);
+            placementUpdates[mark.id] = {
+              markId: mark.id,
+              label: resolveHotspotDisplayLabel(mark),
+              base64: asset.base64,
+              mimeType: asset.file.type,
+              hasAlpha: asset.file.type.includes('png'),
+              imageUrl: asset.previewUrl,
+              aspectRatio: dims.width > 0 && dims.height > 0 ? dims.width / dims.height : 1,
+              center: { x: clamp(mark.x, 0, 1), y: clamp(mark.y, 0, 1) },
+              scale: 1,
+              baseWidthPercent: computeInitialWidthPercent(mark, 0.95),
+              signature,
+              origin: 'user-upload',
+            };
+          } else {
+            const prompt = (imagePrompts[mark.id] ?? '').trim();
+            const asset = await generateHotspotAsset({
+              styleSnapshot: snapshot,
+              intent: 'image',
+              hotspotLabel: resolveHotspotDisplayLabel(mark),
+              description: prompt,
+              placementSummary: buildHotspotSummary(mark),
+              brandColors: brandColors.length > 0 ? brandColors : undefined,
+              aspectRatioHint: computeAspectRatioHint(mark),
+              sizeHint: {
+                widthPx: Math.round((mark.width ?? mark.scale ?? 0) * templateWidth),
+                heightPx: Math.round((mark.height ?? mark.scale ?? 0) * templateHeight),
+              },
+            });
+            const prepared = await prepareOverlayAsset({
+              base64: asset.base64,
+              mimeType: asset.mimeType,
+              enforceTransparency: true,
+            });
+
+            if (!prepared.hasAlpha) {
+              throw new Error(`Unable to create a transparent overlay for ${resolveHotspotDisplayLabel(mark)}. Try adjusting the prompt or retry.`);
+            }
+
+            placementUpdates[mark.id] = {
+              markId: mark.id,
+              label: resolveHotspotDisplayLabel(mark),
+              base64: prepared.base64,
+              mimeType: prepared.mimeType,
+              hasAlpha: prepared.hasAlpha,
+              imageUrl: toDataUrl(prepared.base64, prepared.mimeType),
+              aspectRatio: prepared.width > 0 && prepared.height > 0 ? prepared.width / prepared.height : 1,
+              center: { x: clamp(mark.x, 0, 1), y: clamp(mark.y, 0, 1) },
+              scale: 1,
+              baseWidthPercent: computeInitialWidthPercent(mark, 0.75),
+              signature,
+              origin: 'ai-generated',
+            };
+          }
+        }
+
+        if (Object.keys(placementUpdates).length > 0) {
+          setGeneratedAssets(prev => ({ ...prev, ...placementUpdates }));
+          const lastGenerated = marksNeedingAssets[marksNeedingAssets.length - 1];
+          setActiveHotspotId(lastGenerated.id);
+          setActiveAssetId(lastGenerated.id);
+          setShowHotspotOverlay(true);
+          updates.push(`Prepared draggable asset${marksNeedingAssets.length > 1 ? 's' : ''} for ${marksNeedingAssets.length} hotspot${marksNeedingAssets.length > 1 ? 's' : ''}.`);
+        }
+      }
+
+      const assistantMessage: ChatMessage = {
+        id: `msg-ai-${Date.now()}`,
+        role: 'assistant',
+        type: 'text',
+        text: updates.length > 0
+          ? `${updates.join(' ')}${marksNeedingAssets.length > 0 ? ' Drag the overlays into place and press “Render final creative” once you are happy.' : ''}`
+          : 'No changes were generated—double-check your hotspots and try again.',
+      };
       setChatMessages(prev => [...prev, assistantMessage]);
 
+      baseStyleImageRef.current = latestBaseImageUrl;
     } catch (e) {
       const errorMessage = e instanceof Error ? e.message : 'An unknown error occurred during generation.';
       const errorMsg: ChatMessage = { id: `err-${Date.now()}`, role: 'assistant', type: 'error', text: errorMessage };
@@ -606,7 +1222,28 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     } finally {
       setIsGenerating(false);
     }
-  }, [appUser, ensureProjectPersisted, templateImageUrl, basePrompt, textFields, imageAssets, imagePrompts, imageModes, enabledMarks, aspectRatio, marks, originalMarks, history]);
+  }, [
+    appUser,
+    readyIncludedMarks,
+    ensureProjectPersisted,
+    templateImageUrl,
+    basePrompt,
+    textFields,
+    imageAssets,
+    imagePrompts,
+    imageModes,
+    aspectRatio,
+    marks,
+    originalMarks,
+    originalMarksMap,
+    history,
+    getAssetSignature,
+    generatedAssets,
+    ensureStyleSnapshot,
+    brandColors,
+    buildHotspotSummary,
+    computeAspectRatioHint,
+  ]);
 
   const handleGenerateClick = useCallback(() => {
     if (isGenerating || isDemoMode) return;
@@ -618,6 +1255,108 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     }
     executeGeneration();
   }, [isGenerating, isDemoMode, marks, enabledMarks, executeGeneration]);
+
+  const composeOverlayImage = useCallback(async () => {
+    const assetEntries = Object.values(generatedAssets);
+    if (assetEntries.length === 0) {
+      throw new Error('Nothing to render—generate or adjust hotspot overlays first.');
+    }
+
+    const baseImageRecord = history[activeIndex] ?? history[history.length - 1];
+    const baseImageUrl = baseImageRecord?.imageUrl ?? templateImageUrl;
+    const { base64, mimeType, width, height } = await imageUrlToBase64(baseImageUrl);
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      throw new Error('Unable to obtain canvas context.');
+    }
+
+    const baseImage = await loadImageElement(toDataUrl(base64, mimeType));
+    ctx.drawImage(baseImage, 0, 0, width, height);
+
+    for (const asset of assetEntries) {
+      const { widthPercent, heightPercent } = getAssetDisplayMetrics(asset);
+      const assetWidthPx = (widthPercent / 100) * width;
+      const assetHeightPx = (heightPercent / 100) * height;
+      if (assetWidthPx <= 0 || assetHeightPx <= 0) continue;
+
+      const centerX = clamp(asset.center.x, 0, 1) * width;
+      const centerY = clamp(asset.center.y, 0, 1) * height;
+
+      const assetImage = await loadImageElement(asset.imageUrl);
+      ctx.drawImage(
+        assetImage,
+        centerX - assetWidthPx / 2,
+        centerY - assetHeightPx / 2,
+        assetWidthPx,
+        assetHeightPx
+      );
+    }
+
+    const compositeBlob: Blob | null = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+    if (!compositeBlob) {
+      throw new Error('Failed to render composite image.');
+    }
+
+    return { blob: compositeBlob };
+  }, [
+    generatedAssets,
+    history,
+    activeIndex,
+    templateImageUrl,
+    getAssetDisplayMetrics,
+  ]);
+
+  const handleRenderComposite = useCallback(async () => {
+    if (isRenderingComposite || !appUser) return;
+    if (!overlaysPresent) {
+      const infoMessage: ChatMessage = {
+        id: `msg-ai-${Date.now()}`,
+        role: 'assistant',
+        type: 'text',
+        text: 'Nothing to render—generate or adjust hotspot overlays first.',
+      };
+      setChatMessages(prev => [...prev, infoMessage]);
+      return;
+    }
+
+    setIsRenderingComposite(true);
+    try {
+      const { blob } = await composeOverlayImage();
+
+      const newImageUrl = await uploadFileToStorage(blob, `projects/${appUser.id}/generated`);
+      const newCreative: GeneratedImage = { id: `gen-${Date.now()}`, imageUrl: newImageUrl, prompt: 'Manual overlay composite' };
+      const baseHistory = history.slice(0, activeIndex + 1);
+      const updatedHistory = [...baseHistory, newCreative];
+      setHistory(updatedHistory);
+      setActiveIndex(updatedHistory.length - 1);
+      await ensureProjectPersisted(updatedHistory);
+
+      const assistantMessage: ChatMessage = {
+        id: `msg-ai-${Date.now()}`,
+        role: 'assistant',
+        type: 'text',
+        text: 'Rendered a new version with your overlays applied.',
+      };
+      setChatMessages(prev => [...prev, assistantMessage]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to render the composite image.';
+      const errorMsg: ChatMessage = { id: `err-${Date.now()}`, role: 'assistant', type: 'error', text: message };
+      setChatMessages(prev => [...prev, errorMsg]);
+    } finally {
+      setIsRenderingComposite(false);
+    }
+  }, [
+    isRenderingComposite,
+    appUser,
+    overlaysPresent,
+    composeOverlayImage,
+    history,
+    activeIndex,
+    ensureProjectPersisted,
+  ]);
 
   const handleChatEdit = async (e: FormEvent) => {
     e.preventDefault();
@@ -814,102 +1553,37 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setIsPlacingMark(null);
   };
 
-  const removeMark = (markId: string) => {
-    setMarks(prev => prev.filter(m => m.id !== markId));
-    setEnabledMarks(prev => { const next = {...prev}; delete next[markId]; return next; });
-    setTextFields(prev => { const next = {...prev}; delete next[markId]; return next; });
-    setImageAssets(prev => { const next = {...prev}; delete next[markId]; return next; });
-    setImageModes(prev => { const next = {...prev}; delete next[markId]; return next; });
-    setImagePrompts(prev => { const next = {...prev}; delete next[markId]; return next; });
-    delete canvasHotspotRefs.current[markId];
-    if (activeHotspotId === markId) {
-      setActiveHotspotId(null);
-    }
-  };
-  
-  const handleDownload = () => {
+  const handleDownload = useCallback(async () => {
     if (!canDownloadActiveImage || !activeImage) return;
     const watermark = isProUser ? undefined : 'Made with getmycreative';
+
+    if (overlaysPresent) {
+      try {
+        const { blob } = await composeOverlayImage();
+        const objectUrl = URL.createObjectURL(blob);
+        downloadImage(objectUrl, `creative-${activeImage.id}.png`, watermark);
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 2000);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to prepare download.';
+        const errorMsg: ChatMessage = { id: `err-${Date.now()}`, role: 'assistant', type: 'error', text: message };
+        setChatMessages(prev => [...prev, errorMsg]);
+      }
+      return;
+    }
+
     downloadImage(activeImage.imageUrl, `creative-${activeImage.id}.png`, watermark);
-  };
-  
-  const includedMarks = useMemo(() => marks.filter(mark => enabledMarks[mark.id]), [marks, enabledMarks]);
-  const ignoredMarks = useMemo(() => marks.filter(mark => !enabledMarks[mark.id]), [marks, enabledMarks]);
-
-  const readyIncludedMarks = useMemo(() => {
-    return includedMarks.filter(mark => canEnableMark(mark.id));
-  }, [includedMarks, canEnableMark]);
-
-  const missingIncludedMarks = useMemo(() => {
-    const readyIds = new Set(readyIncludedMarks.map(mark => mark.id));
-    return includedMarks.filter(mark => !readyIds.has(mark.id));
-  }, [includedMarks, readyIncludedMarks]);
-
-  const missingIncludedMarksCount = Math.max(0, includedMarks.length - readyIncludedMarks.length);
-
-  const renderGlobalControls = () => (
-    <div className="grid w-full grid-cols-1 gap-4 sm:grid-cols-2">
-      <div className="relative rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-        <p className="font-medium text-gray-800">Aspect ratio</p>
-        <p className="mt-1 text-xs text-gray-500">Pick the format for your next render.</p>
-        <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
-          {['original', '1:1', '16:9', '9:16'].map(option => (
-            <button
-              key={option}
-              type="button"
-              onClick={() => setAspectRatio(option)}
-              className={`rounded-lg border px-3 py-2 text-sm font-semibold capitalize transition-colors ${
-                aspectRatio === option ? 'border-emerald-500 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-white text-gray-600 hover:bg-slate-50'
-              }`}
-            >
-              {option === 'original' ? 'Original' : option.replace(':', ':')}
-            </button>
-          ))}
-        </div>
-      </div>
-      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-        <div className="flex items-center justify-between">
-          <p className="font-medium text-gray-800">Brand palette</p>
-          <button
-            type="button"
-            onClick={() => setIsSettingsOpen(true)}
-            className="text-xs font-semibold text-emerald-600 hover:text-emerald-700"
-          >
-            Adjust
-          </button>
-        </div>
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          {brandColors.length > 0 ? (
-            brandColors.map(color => (
-              <span
-                key={color}
-                className="h-7 w-7 rounded-full border border-white shadow-sm"
-                style={{ backgroundColor: color }}
-                title={color}
-              />
-            ))
-          ) : (
-            <p className="text-xs text-gray-500 leading-relaxed">Stick with the template colors or tap Adjust to choose your brand palette.</p>
-          )}
-        </div>
-        {isSettingsOpen && (
-          <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4 shadow-lg">
-            <ColorPaletteSelector
-              selectedPalette={brandColors}
-              onPaletteChange={palette => {
-                setBrandColors(palette);
-                setIsSettingsOpen(false);
-              }}
-              userBrandColors={appUser?.brandColors}
-            />
-          </div>
-        )}
-      </div>
-    </div>
-  );
-
+  }, [
+    canDownloadActiveImage,
+    activeImage,
+    isProUser,
+    overlaysPresent,
+    composeOverlayImage,
+    setChatMessages,
+  ]);
   const renderFloatingActions = () => {
     const disabled = isGenerating || isDemoMode || includedMarks.length === 0;
+    const assetsAvailable = overlaysPresent;
+    const renderDisabled = isRenderingComposite || !assetsAvailable;
     const handleChatClick = () => {
       if (!isProUser || !appUser) return;
       setIsChatDrawerOpen(true);
@@ -937,6 +1611,15 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
           >
             {isGenerating ? 'Generating…' : (<><SparklesIcon className="h-5 w-5" />Generate creative</>)}
           </button>
+          <button
+            onClick={handleRenderComposite}
+            disabled={renderDisabled}
+            className={`flex flex-1 items-center justify-center gap-2 rounded-full px-5 py-3 text-sm font-semibold shadow-lg transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-300 focus:ring-offset-2 ${
+              renderDisabled ? 'bg-slate-400/60 text-white/80 cursor-not-allowed' : 'bg-slate-700 text-white hover:bg-slate-600'
+            }`}
+          >
+            {isRenderingComposite ? 'Rendering…' : 'Render final creative'}
+          </button>
         </div>
       </div>
     );
@@ -957,6 +1640,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     const displayLabel = resolveHotspotDisplayLabel(activeMark);
     const labelPending = isHotspotLabelPending(activeMark);
     const includeReady = canEnableMark(markId);
+    const generatedAsset = generatedAssets[markId];
+    const assetScaleValue = generatedAsset ? Math.round(generatedAsset.scale * 100) : 100;
 
     const normalizedLabel = (activeMark.label ?? '').toLowerCase();
     const textRows = normalizedLabel.includes('body') ? 4 : 2;
@@ -1155,6 +1840,55 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                                 <button type="button" onClick={handleClose} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500">
                                     Done
                                 </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {generatedAsset && (
+                        <div className="space-y-3 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3">
+                            <div className="flex items-center justify-between">
+                                <p className="text-sm font-semibold text-emerald-900">Overlay asset ready</p>
+                                <button
+                                    type="button"
+                                    onClick={() => removeAsset(markId)}
+                                    className="text-xs font-semibold text-emerald-700 hover:text-emerald-800"
+                                >
+                                    Remove
+                                </button>
+                            </div>
+                            <img
+                                src={generatedAsset.imageUrl}
+                                alt={`${displayLabel} overlay preview`}
+                                className="w-full rounded-lg border border-emerald-100 bg-white p-2 shadow-sm"
+                            />
+                            <div className="space-y-2">
+                                <label className="flex items-center justify-between text-xs font-semibold uppercase tracking-wide text-emerald-700">
+                                    <span>Scale</span>
+                                    <span className="font-mono text-emerald-900">{(generatedAsset.scale * 100).toFixed(0)}%</span>
+                                </label>
+                                <input
+                                    type="range"
+                                    min={40}
+                                    max={160}
+                                    value={assetScaleValue}
+                                    onChange={event => {
+                                        const nextValue = Number(event.target.value);
+                                        const nextScale = clamp(nextValue / 100, 0.4, 2);
+                                        updateAssetPlacement(markId, { scale: nextScale });
+                                    }}
+                                    className="w-full accent-emerald-600"
+                                />
+                                <p className="text-xs text-emerald-900">Drag the overlay on the canvas to reposition. Use the slider to resize without losing proportions.</p>
+                            </div>
+                            <div className="flex items-center justify-between">
+                                <button
+                                    type="button"
+                                    onClick={() => updateAssetPlacement(markId, { center: { x: clamp(activeMark.x, 0, 1), y: clamp(activeMark.y, 0, 1) }, scale: 1 })}
+                                    className="text-xs font-semibold text-emerald-700 hover:text-emerald-800"
+                                >
+                                    Reset placement
+                                </button>
+                                <span className="text-xs text-emerald-800">Export via “Render final creative”.</span>
                             </div>
                         </div>
                     )}
@@ -1477,7 +2211,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
               <div className="absolute right-4 top-4 rounded-full bg-black/50 px-2 py-1 text-xs text-white">
                 {activeIndex === 0 ? 'Template' : `Version ${activeIndex}`}
               </div>
-              {history.length > 1 && (
+              {activeImage && (
                 <div className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-2xl bg-black/60 opacity-0 transition-opacity group-hover:opacity-100">
                   <button
                     onClick={handleDownload}
@@ -1539,6 +2273,39 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                         isActive={activeHotspotId === mark.id}
                         isHovered={hoveredMarkId === mark.id}
                       />
+                    );
+                  })}
+                  {Object.values(generatedAssets).map(asset => {
+                    const mark = marks.find(m => m.id === asset.markId);
+                    if (!mark) return null;
+                    const { widthPercent, heightPercent } = getAssetDisplayMetrics(asset);
+                    const style: CSSProperties = {
+                      left: `${clamp(asset.center.x * 100, 0, 100)}%`,
+                      top: `${clamp(asset.center.y * 100, 0, 100)}%`,
+                      width: `${widthPercent}%`,
+                      height: `${heightPercent}%`,
+                      transform: 'translate(-50%, -50%)',
+                      aspectRatio: asset.aspectRatio || undefined,
+                    };
+                    const isActive = activeAssetId === asset.markId;
+                    return (
+                      <div
+                        key={`asset-${asset.markId}`}
+                        className={`absolute pointer-events-auto cursor-grab rounded-xl border ${isActive ? 'border-emerald-500 shadow-lg' : 'border-transparent'} ${isGenerating ? 'cursor-wait opacity-70' : 'hover:border-emerald-400 hover:shadow-lg'}`}
+                        style={style}
+                        onPointerDown={event => handleAssetPointerDown(event, asset)}
+                        onPointerMove={handleAssetPointerMove}
+                        onPointerUp={handleAssetPointerUp}
+                        onPointerCancel={handleAssetPointerUp}
+                      >
+                        <img
+                          src={asset.imageUrl}
+                          alt={`${resolveHotspotDisplayLabel(mark)} overlay`}
+                          className="h-full w-full select-none rounded-lg shadow-sm object-contain"
+                          draggable={false}
+                          style={{ aspectRatio: asset.aspectRatio || undefined }}
+                        />
+                      </div>
                     );
                   })}
                   {draftMark && (

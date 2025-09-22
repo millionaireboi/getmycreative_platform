@@ -28,6 +28,33 @@ export interface Mark {
   isNew?: boolean; // Flag for dynamically added marks
 }
 
+export type TypographyRole =
+  | 'headline'
+  | 'subheading'
+  | 'body'
+  | 'caption'
+  | 'accent'
+  | 'decorative';
+
+export interface TemplateTypographyStyle {
+  role: TypographyRole;
+  description: string;
+  primaryColor?: string;
+  casing?: 'uppercase' | 'title' | 'sentence' | 'mixed';
+}
+
+export interface TemplateStyleSnapshot {
+  version: number;
+  extractedAt: Date;
+  palette: string[];
+  accentPalette?: string[];
+  typography: TemplateTypographyStyle[];
+  motifKeywords: string[];
+  textureSummary?: string;
+  lightingSummary?: string;
+  additionalNotes?: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';

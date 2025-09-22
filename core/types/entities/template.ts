@@ -1,4 +1,4 @@
-import { Mark } from '../shared.ts';
+import { Mark, TemplateStyleSnapshot } from '../shared.ts';
 
 export enum TemplateStatus {
   DRAFT = 'draft',
@@ -34,6 +34,7 @@ export interface Template {
   designerId: string | null; // null for initial system templates
   rejectionReason?: string;
   palette?: string[]; // Store the palette with the template
+  styleSnapshot?: TemplateStyleSnapshot;
   isAnalyzed?: boolean; // True if the template has been analyzed by AI
   
   // -- Versioning Fields --

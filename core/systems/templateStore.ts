@@ -1,8 +1,8 @@
-import { Template, TemplateStatus, Mark } from '../types/index.ts';
+import { Template, TemplateStatus, Mark, TemplateStyleSnapshot, TemplateTypographyStyle, TypographyRole } from '../types/index.ts';
 import { db } from '../../firebase/config.ts';
 import { INITIAL_TEMPLATES, LEGACY_TEMPLATE_IDS, LEGACY_TEMPLATE_IMAGE_PREFIXES } from '../../constants.ts';
 // Use standard Firebase v9+ modular SDK imports
-import {
+import { 
     collection,
     query,
     where,
@@ -23,6 +23,129 @@ import {
 
 const templatesCollection = collection(db, 'templates');
 const LEGACY_TEMPLATE_ID_SET = new Set(LEGACY_TEMPLATE_IDS);
+
+const cleanHexArray = (input: unknown): string[] => {
+    if (!Array.isArray(input)) return [];
+    return input
+        .filter((value): value is string => typeof value === 'string')
+        .map(value => value.trim())
+        .filter(value => /^#?[0-9A-Fa-f]{3,8}$/.test(value))
+        .map(value => (value.startsWith('#') ? value : `#${value}`));
+};
+
+const cleanTypographyArray = (input: unknown): TemplateTypographyStyle[] => {
+    if (!Array.isArray(input)) return [];
+    const allowedRoles = new Set<TypographyRole>(['headline', 'subheading', 'body', 'caption', 'accent', 'decorative']);
+    return input
+        .map(item => {
+            if (!item || typeof item !== 'object') return null;
+            const role = (item as { role?: string }).role;
+            const description = (item as { description?: string }).description;
+            if (typeof role !== 'string' || typeof description !== 'string') return null;
+            if (!allowedRoles.has(role as TypographyRole)) return null;
+            const typography: TemplateTypographyStyle = {
+                role: role as TypographyRole,
+                description: description.trim(),
+            };
+            const casing = (item as { casing?: string }).casing;
+            if (typeof casing === 'string' && ['uppercase', 'title', 'sentence', 'mixed'].includes(casing)) {
+                typography.casing = casing as TemplateTypographyStyle['casing'];
+            }
+            const color = (item as { primaryColor?: string }).primaryColor;
+            if (typeof color === 'string' && color.trim()) {
+                typography.primaryColor = color.trim().startsWith('#') ? color.trim() : `#${color.trim()}`;
+            }
+            return typography;
+        })
+        .filter((item): item is TemplateTypographyStyle => item !== null && item.description.length > 0);
+};
+
+const cleanMotifs = (input: unknown): string[] => {
+    if (!Array.isArray(input)) return [];
+    return input
+        .filter((value): value is string => typeof value === 'string')
+        .map(value => value.trim())
+        .filter(value => value.length > 0)
+        .slice(0, 12);
+};
+
+const deserializeStyleSnapshot = (snapshot: unknown): TemplateStyleSnapshot | undefined => {
+    if (!snapshot || typeof snapshot !== 'object') {
+        return undefined;
+    }
+    const raw = snapshot as Record<string, unknown>;
+    const version = typeof raw.version === 'number' ? raw.version : 1;
+    const extractedAtRaw = raw.extractedAt;
+    let extractedAt = new Date();
+    if (extractedAtRaw instanceof Timestamp) {
+        extractedAt = extractedAtRaw.toDate();
+    } else if (typeof extractedAtRaw === 'object' && extractedAtRaw !== null && 'toDate' in (extractedAtRaw as any)) {
+        try {
+            extractedAt = (extractedAtRaw as { toDate: () => Date }).toDate();
+        } catch {
+            extractedAt = new Date();
+        }
+    } else if (typeof extractedAtRaw === 'string' || typeof extractedAtRaw === 'number') {
+        const parsed = new Date(extractedAtRaw);
+        extractedAt = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+    }
+
+    const palette = cleanHexArray(raw.palette);
+    const accentPalette = cleanHexArray(raw.accentPalette);
+    const typography = cleanTypographyArray(raw.typography);
+    const motifKeywords = cleanMotifs(raw.motifKeywords);
+
+    return {
+        version,
+        extractedAt,
+        palette,
+        accentPalette: accentPalette.length > 0 ? accentPalette : undefined,
+        typography,
+        motifKeywords,
+        textureSummary: typeof raw.textureSummary === 'string' ? raw.textureSummary.trim() : undefined,
+        lightingSummary: typeof raw.lightingSummary === 'string' ? raw.lightingSummary.trim() : undefined,
+        additionalNotes: typeof raw.additionalNotes === 'string' ? raw.additionalNotes.trim() : undefined,
+    };
+};
+
+const serializeStyleSnapshot = (snapshot?: TemplateStyleSnapshot | null) => {
+    if (!snapshot) return undefined;
+
+    const extractedAt = snapshot.extractedAt instanceof Date ? snapshot.extractedAt : new Date(snapshot.extractedAt);
+
+    const palette = cleanHexArray(snapshot.palette);
+    const typography = Array.isArray(snapshot.typography) ? snapshot.typography : [];
+    const motifKeywords = cleanMotifs(snapshot.motifKeywords);
+
+    const payload: Record<string, unknown> = {
+        version: typeof snapshot.version === 'number' ? snapshot.version : 1,
+        extractedAt: Timestamp.fromDate(extractedAt),
+        palette,
+        typography: typography.map(item => ({
+            role: item.role,
+            description: item.description,
+            ...(item.primaryColor ? { primaryColor: item.primaryColor } : {}),
+            ...(item.casing ? { casing: item.casing } : {}),
+        })),
+        motifKeywords,
+    };
+
+    const accentPalette = cleanHexArray(snapshot.accentPalette);
+    if (accentPalette.length > 0) {
+        payload.accentPalette = accentPalette;
+    }
+    if (snapshot.textureSummary) {
+        payload.textureSummary = snapshot.textureSummary;
+    }
+    if (snapshot.lightingSummary) {
+        payload.lightingSummary = snapshot.lightingSummary;
+    }
+    if (snapshot.additionalNotes) {
+        payload.additionalNotes = snapshot.additionalNotes;
+    }
+
+    return payload;
+};
 
 const stripLegacyTemplates = (templates: Template[]): Template[] => {
     return templates.filter(template => {
@@ -55,10 +178,14 @@ const docToTemplate = (doc: DocumentSnapshot<DocumentData>): Template => {
     const useCases = Array.isArray(data.useCases)
         ? data.useCases.filter((entry: unknown): entry is string => typeof entry === 'string' && entry.trim().length > 0)
         : [];
+    const styleSnapshot = deserializeStyleSnapshot(data.styleSnapshot);
+    const palette = cleanHexArray(data.palette);
 
     return {
         id: doc.id,
         ...data,
+        palette: palette.length > 0 ? palette : styleSnapshot?.palette,
+        styleSnapshot,
         createdAt: createdAt,
         updatedAt: updatedAt,
         useCases,
@@ -114,9 +241,11 @@ export const createTemplate = async (
     designerId: string, 
     imageUrl: string, 
     title: string,
-    initialData?: { marks: Mark[], prompt: string, tags: string[], useCases?: string[] }
+    initialData?: { marks: Mark[], prompt: string, tags: string[], useCases?: string[], styleSnapshot?: TemplateStyleSnapshot }
 ): Promise<Template> => {
     const now = new Date();
+    const serializedStyleSnapshot = serializeStyleSnapshot(initialData?.styleSnapshot);
+    const paletteFromSnapshot = initialData?.styleSnapshot?.palette ?? [];
     const newTemplateData = {
         designerId,
         imageUrl,
@@ -141,14 +270,24 @@ export const createTemplate = async (
         updatedAt: Timestamp.fromDate(now),
     };
 
+    if (paletteFromSnapshot.length > 0) {
+        (newTemplateData as Record<string, unknown>).palette = paletteFromSnapshot;
+    }
+
+    if (serializedStyleSnapshot) {
+        (newTemplateData as Record<string, unknown>).styleSnapshot = serializedStyleSnapshot;
+    }
+
     const docRef = await addDoc(templatesCollection, newTemplateData);
 
     return {
         id: docRef.id,
         ...newTemplateData,
+        palette: paletteFromSnapshot.length > 0 ? paletteFromSnapshot : undefined,
+        styleSnapshot: initialData?.styleSnapshot,
         createdAt: now,
         updatedAt: now,
-    };
+    } as Template;
 };
 
 // FIX: Added missing 'trackTemplateUsage' function.

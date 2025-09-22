@@ -2,7 +2,7 @@
 
 
 import { GoogleGenAI, Modality, Type } from "@google/genai";
-import { BrandAsset, Mark } from '../core/types/shared.ts';
+import { BrandAsset, Mark, TemplateStyleSnapshot, TemplateTypographyStyle, TypographyRole } from '../core/types/shared.ts';
 import { ALL_TAGS } from "../constants.ts";
 
 type PlacementGeometry = {
@@ -26,6 +26,89 @@ type PlacementGeometry = {
 
 // Prefer Vite-style env var; fall back to legacy define for compatibility.
 const API_KEY = (import.meta as any).env?.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
+
+const ALLOWED_TYPOGRAPHY_ROLES: TypographyRole[] = ['headline', 'subheading', 'body', 'caption', 'accent', 'decorative'];
+
+const normalizeHex = (value: string): string | null => {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const prefixed = trimmed.startsWith('#') ? trimmed : `#${trimmed}`;
+  return /^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{4}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$/.test(prefixed) ? prefixed.toUpperCase() : null;
+};
+
+const sanitizePalette = (input: unknown): string[] => {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set<string>();
+  input.forEach(value => {
+    if (typeof value !== 'string') return;
+    const normalized = normalizeHex(value);
+    if (!normalized) return;
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+    }
+  });
+  return Array.from(seen).slice(0, 8);
+};
+
+const sanitizeTypography = (input: unknown): TemplateTypographyStyle[] => {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map(entry => {
+      if (!entry || typeof entry !== 'object') return null;
+      const role = (entry as { role?: unknown }).role;
+      const description = (entry as { description?: unknown }).description;
+      if (typeof role !== 'string' || typeof description !== 'string') return null;
+      const normalizedRole = role.toLowerCase() as TypographyRole;
+      if (!ALLOWED_TYPOGRAPHY_ROLES.includes(normalizedRole)) return null;
+      const clean: TemplateTypographyStyle = {
+        role: normalizedRole,
+        description: description.trim(),
+      };
+      const casing = (entry as { casing?: unknown }).casing;
+      if (typeof casing === 'string' && ['uppercase', 'title', 'sentence', 'mixed'].includes(casing)) {
+        clean.casing = casing as TemplateTypographyStyle['casing'];
+      }
+      const primaryColor = (entry as { primaryColor?: unknown }).primaryColor;
+      if (typeof primaryColor === 'string') {
+        const normalized = normalizeHex(primaryColor);
+        if (normalized) {
+          clean.primaryColor = normalized;
+        }
+      }
+      return clean;
+    })
+    .filter((item): item is TemplateTypographyStyle => !!item && item.description.length > 0)
+    .slice(0, 6);
+};
+
+const sanitizeMotifs = (input: unknown): string[] => {
+  if (!Array.isArray(input)) return [];
+  return input
+    .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    .map(entry => entry.trim())
+    .slice(0, 12);
+};
+
+const pngHasAlphaChannel = (base64: string): boolean => {
+  try {
+    const binaryString = typeof atob === 'function' ? atob(base64) : Buffer.from(base64, 'base64').toString('binary');
+    if (binaryString.length < 26) {
+      return true; // Too small to validate, assume ok to avoid false negatives.
+    }
+    const colorType = binaryString.charCodeAt(25);
+    if (colorType === 4 || colorType === 6) {
+      return true;
+    }
+    // Look for tRNS chunk which also implies transparency.
+    if (binaryString.indexOf('tRNS') !== -1) {
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.warn('Could not verify PNG alpha channel:', error);
+    return true; // Fail open if environment does not support validation.
+  }
+};
 
 let ai: GoogleGenAI | null = null;
 
@@ -56,6 +139,26 @@ export interface ChatEditOptions {
     mentions?: string[];
 }
 
+export interface HotspotAssetRequest {
+  styleSnapshot: TemplateStyleSnapshot;
+  intent: 'text' | 'image';
+  hotspotLabel: string;
+  textContent?: string;
+  description?: string;
+  brandColors?: string[];
+  placementSummary?: string;
+  aspectRatioHint?: string;
+  sizeHint?: { widthPx?: number; heightPx?: number; aspectRatio?: string };
+  hotspotCrop?: { base64: string; mimeType: string };
+  templateThumbnail?: { base64: string; mimeType: string };
+}
+
+export interface HotspotAssetResult {
+  base64: string;
+  mimeType: string;
+  hasAlpha: boolean;
+}
+
 
 export const generateCreative = async (
   originalTemplateBase64: string,
@@ -69,7 +172,10 @@ export const generateCreative = async (
   aspectRatio: string,
   marks: Mark[],
   initialMarks: Mark[],
-  canvasDimensions?: { width: number; height: number }
+  options: {
+    canvasDimensions?: { width: number; height: number };
+    overlayTextMarkIds?: string[];
+  } = {}
 ): Promise<string> => {
   const ai = getAi();
   const promptParts: any[] = [];
@@ -77,6 +183,10 @@ export const generateCreative = async (
   const escapeSingleQuotes = (value: string) => value.replace(/'/g, "\\'");
   const newTextHotspots: string[] = [];
   const newImageHotspots: string[] = [];
+  const overlayNewTextHotspots: string[] = [];
+
+  const canvasDimensions = options.canvasDimensions;
+  const overlayTextMarkIdSet = new Set(options.overlayTextMarkIds ?? []);
 
   const canvasWidth = canvasDimensions?.width ?? 0;
   const canvasHeight = canvasDimensions?.height ?? 0;
@@ -152,14 +262,18 @@ export const generateCreative = async (
   const contextMarksForHints = initialMarks.length > 0 ? initialMarks : marks;
 
   const getGeometryFor = (mark: Mark): PlacementGeometry | null => {
-    let geometry = geometryMap.get(mark.id);
-    if (!geometry) {
-      geometry = computeGeometry(mark);
-      if (geometry) {
-        geometryMap.set(mark.id, geometry);
-      }
+    const cached = geometryMap.get(mark.id);
+    if (cached) {
+      return cached;
     }
-    return geometry;
+
+    const computed = computeGeometry(mark);
+    if (computed) {
+      geometryMap.set(mark.id, computed);
+      return computed;
+    }
+
+    return null;
   };
 
   const buildPaddingText = (geometry: PlacementGeometry): string => {
@@ -320,20 +434,40 @@ export const generateCreative = async (
     const isExistingMark = initialMarkIds.has(mark.id);
 
     if (mark.type === 'text') {
-      const newText = textFields[mark.id];
-      if (newText) {
-          if (isExistingMark) {
-            const originalText = initialMarks.find(m => m.id === mark.id)?.text;
-            if (originalText && originalText.trim() !== '') {
-              editInstructions.push(`- Find the text "${originalText}" and replace it with: "${newText}". The new text must perfectly replicate the font family, weight, size, color, style, and any effects (like shadows or outlines) of the original text.`);
-            } else {
-              editInstructions.push(`- Replace the text labeled '${mark.label}' with: "${newText}". The new text must perfectly replicate the font family, weight, size, color, style, and any effects (like shadows or outlines) of the original text.`);
-            }
+      const proposedText = typeof textFields[mark.id] === 'string' ? textFields[mark.id].trim() : '';
+      const useOverlay = overlayTextMarkIdSet.has(mark.id);
+
+      if (useOverlay) {
+        if (mark.isNew) {
+          overlayNewTextHotspots.push(readableLabel(mark));
+        }
+
+        if (isExistingMark) {
+          const originalText = initialMarks.find(m => m.id === mark.id)?.text?.trim();
+          const placementSummary = describePlacementArea(mark);
+          const removalLabel = readableLabel(mark);
+          const removalInstruction = originalText && originalText.length > 0
+            ? `- Remove the existing ${removalLabel} copy "${originalText}" entirely. After erasing, repaint the exposed background using colours, gradients, and lighting sampled from the surrounding design so the zone looks untouched. Leave the hotspot completely blank for a separate overlay. ${placementSummary} ${noBorderClause} Absolutely no new lettering, glyphs, placeholders, or guide marks may remain after this cleanup.`
+            : `- Clear the ${removalLabel} hotspot of any lettering. Rebuild the underlying background so it blends seamlessly with the adjacent artwork, then leave the area blank for a later overlay. ${placementSummary} ${noBorderClause} Do not introduce fresh text, tracings, or placeholder hints at this stage.`;
+          editInstructions.push(removalInstruction);
+        }
+
+        // Skip default text replacement logic when operating in overlay mode.
+        return;
+      }
+
+      if (proposedText) {
+        if (isExistingMark) {
+          const originalText = initialMarks.find(m => m.id === mark.id)?.text;
+          if (originalText && originalText.trim() !== '') {
+            editInstructions.push(`- Find the text "${originalText}" and replace it with: "${proposedText}". The new text must perfectly replicate the font family, weight, size, color, style, and any effects (like shadows or outlines) of the original text.`);
           } else {
-            // New logic for adding text
-            editInstructions.push(`- Add a brand-new text element for '${mark.label}' inside the designated hotspot. This MUST create additional copy without replacing or hiding any existing text elsewhere in the creative. Insert exactly: "${newText}". Critical instructions: Place this text ON TOP of the existing template canvas. ${describePlacementArea(mark)} Keep the text horizontally and vertically centered within that invisible guide. The baseline should sit midway between the top and bottom edges of the imagined zone. ${noBorderClause} Do NOT place the copy inside a capsule, label, speech bubble, or box unless the original template already used one in that location. It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new text. The text's style, font, kerning, leading, and color should match the overall aesthetic of the template.`);
-            newTextHotspots.push(newText);
+            editInstructions.push(`- Replace the text labeled '${mark.label}' with: "${proposedText}". The new text must perfectly replicate the font family, weight, size, color, style, and any effects (like shadows or outlines) of the original text.`);
           }
+        } else {
+          editInstructions.push(`- Add a brand-new text element for '${mark.label}' inside the designated hotspot. This MUST create additional copy without replacing or hiding any existing text elsewhere in the creative. Insert exactly: "${proposedText}". Critical instructions: Place this text ON TOP of the existing template canvas. ${describePlacementArea(mark)} Keep the text horizontally and vertically centered within that invisible guide. The baseline should sit midway between the top and bottom edges of the imagined zone. ${noBorderClause} Do NOT place the copy inside a capsule, label, speech bubble, or box unless the original template already used one in that location. It is absolutely forbidden to alter the original template's dimensions or aspect ratio to fit this new text. The text's style, font, kerning, leading, and color should match the overall aesthetic of the template.`);
+          newTextHotspots.push(proposedText);
+        }
       }
     } else if (mark.type === 'image') {
        const mode = imageModes[mark.id] || 'upload';
@@ -369,7 +503,7 @@ export const generateCreative = async (
     ? "The output image's aspect ratio and dimensions MUST EXACTLY match the original template's."
     : `The output image MUST have a final aspect ratio of ${aspectRatio}. Adapt the template's layout to fit this new aspect ratio gracefully.`;
 
-  const hasNewHotspots = newTextHotspots.length > 0 || newImageHotspots.length > 0;
+  const hasNewHotspots = newTextHotspots.length > 0 || newImageHotspots.length > 0 || overlayNewTextHotspots.length > 0;
   const newHotspotDirective = hasNewHotspots
     ? `    5.  **NEW HOTSPOT CONTENT:** When instructions say "add" or reference a new hotspot, treat that hotspot area as an empty, invisible layer that needs fresh content. Keep all existing text, logos, and imagery untouched. Generate only the new element within the specified bounds—never rewrite, remove, or restyle other parts of the creative. Hotspot guides are invisible; never display their outlines, boxes, or alignment aids in the finished render, even when multiple hotspots are added together. Fulfil each hotspot independently—do not group them into a shared card, banner, or container.`
     : '';
@@ -393,6 +527,10 @@ export const generateCreative = async (
   `
     : '';
 
+  const overlayReminder = overlayNewTextHotspots.length > 0
+    ? `\n    Additional context: The user will place independent PNG overlays for these hotspots: ${overlayNewTextHotspots.join(', ')}. After you restore their backgrounds, leave them completely blank so the overlays can sit directly on top.`
+    : '';
+
   const textPrompt = `
     You are a precise and expert creative director AI. Your task is to perform specific in-place edits on a template image. You must follow all instructions exactly.
 
@@ -401,7 +539,7 @@ export const generateCreative = async (
     2.  **ABSOLUTE DIMENSION LOCK:** It is absolutely forbidden to alter the original template's dimensions or aspect ratio unless an explicit 'Aspect Ratio Requirement' is given below. Do NOT expand, crop, or change the canvas size to fit new elements. New elements are always placed ON TOP of the existing canvas, within its original boundaries. This is the most important rule.
     3.  **SEAMLESS INTEGRATION:** All new or replaced elements (text and images) must be perfectly integrated. Match the original template's lighting, perspective, style, and quality.
     4.  **BOUNDING BOX COMPLIANCE:** When a placement region is described, treat it as an invisible clipping mask. The new element must stay fully inside its bounds with no drift. If the request mentions centering, keep the element centered in both axes within that region. Never add borders, strokes, halos, stickers, or shadows around the region—and when multiple hotspots are generated together, keep each element frameless with no shared panels or outlines. Remove any placeholder guides before delivering the final image.
-${newHotspotDirective ? `\n${newHotspotDirective}` : ''}
+${newHotspotDirective ? `\n${newHotspotDirective}` : ''}${overlayReminder}
 
     **Task Description from Original Brief:** ${basePrompt}
         
@@ -716,6 +854,260 @@ export const extractColorsFromImage = async (imageBase64: string, mimeType: stri
     }
 
     throw new Error("Color extraction failed: The API response was not in the expected format.");
+};
+
+
+export const generateTemplateStyleSnapshot = async (
+  imageBase64: string,
+  mimeType: string
+): Promise<TemplateStyleSnapshot> => {
+  const ai = getAi();
+  const prompt = `
+    You are a senior brand designer. Analyze this creative template and summarise its visual language so future overlays can stay consistent.
+
+    Respond with a JSON object following this contract:
+    {
+      "palette": string[3-6],                    // Dominant brand colors as hex codes.
+      "accentPalette": string[0-4],             // Supporting or contrasting colors as hex codes.
+      "typography": Array<{
+        "role": "headline" | "subheading" | "body" | "caption" | "accent" | "decorative",
+        "description": string,                 // Concise but vivid description of the letterforms and styling.
+        "primaryColor"?: string,               // Hex color primarily used for this style.
+        "casing"?: "uppercase" | "title" | "sentence" | "mixed"
+      }>                                          // Include up to 5 distinctive styles.
+      "motifKeywords": string[3-8],             // Distinct motifs/patterns/illustration cues as short phrases.
+      "textureSummary"?: string,                // Describe texture/finishing if relevant.
+      "lightingSummary"?: string,               // Summarise lighting or glow behaviour.
+      "additionalNotes"?: string               // Guardrails for future assets.
+    }
+
+    Keep every string under 160 characters.
+  `;
+
+  const result = await ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: {
+      parts: [
+        { inlineData: { data: imageBase64, mimeType } },
+        { text: prompt },
+      ],
+    },
+    config: {
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          palette: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: 'Primary color palette as hex codes.',
+          },
+          accentPalette: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: 'Accent colors as hex codes.',
+          },
+          typography: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                role: { type: Type.STRING },
+                description: { type: Type.STRING },
+                primaryColor: { type: Type.STRING },
+                casing: { type: Type.STRING },
+              },
+              required: ['role', 'description'],
+            },
+            description: 'Typography treatments.',
+          },
+          motifKeywords: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: 'Key stylistic motifs.',
+          },
+          textureSummary: { type: Type.STRING },
+          lightingSummary: { type: Type.STRING },
+          additionalNotes: { type: Type.STRING },
+        },
+        required: ['palette', 'typography', 'motifKeywords'],
+        propertyOrdering: [
+          'palette',
+          'accentPalette',
+          'typography',
+          'motifKeywords',
+          'textureSummary',
+          'lightingSummary',
+          'additionalNotes',
+        ],
+      },
+      temperature: 0.2,
+    },
+  });
+
+  const json = result.text;
+  if (!json) {
+    const blockReason = result.promptFeedback?.blockReason;
+    if (blockReason) {
+      throw new Error(`Style analysis blocked: ${blockReason}.`);
+    }
+    throw new Error('Style analysis failed: empty response from Gemini.');
+  }
+
+  const parsed = JSON.parse(json.trim()) as Record<string, unknown>;
+  const palette = sanitizePalette(parsed.palette);
+  if (palette.length === 0) {
+    throw new Error('Style analysis failed: no palette detected.');
+  }
+  const accentPalette = sanitizePalette(parsed.accentPalette);
+  const typography = sanitizeTypography(parsed.typography);
+  const motifKeywords = sanitizeMotifs(parsed.motifKeywords);
+
+  return {
+    version: 1,
+    extractedAt: new Date(),
+    palette,
+    accentPalette: accentPalette.length > 0 ? accentPalette : undefined,
+    typography,
+    motifKeywords,
+    textureSummary: typeof parsed.textureSummary === 'string' ? parsed.textureSummary.trim() || undefined : undefined,
+    lightingSummary: typeof parsed.lightingSummary === 'string' ? parsed.lightingSummary.trim() || undefined : undefined,
+    additionalNotes: typeof parsed.additionalNotes === 'string' ? parsed.additionalNotes.trim() || undefined : undefined,
+  };
+};
+
+export const generateHotspotAsset = async (request: HotspotAssetRequest): Promise<HotspotAssetResult> => {
+  const ai = getAi();
+  const { styleSnapshot, intent, hotspotLabel } = request;
+
+  const paletteText = styleSnapshot.palette.join(', ');
+  const accentText = styleSnapshot.accentPalette?.join(', ');
+  const typographyBullets = styleSnapshot.typography
+    .map(typo => `- ${typo.role.toUpperCase()}: ${typo.description}${typo.primaryColor ? ` (color ${typo.primaryColor})` : ''}`)
+    .join('\n');
+  const motifText = styleSnapshot.motifKeywords.join(', ');
+  const motifBullet = motifText
+    ? intent === 'text'
+      ? `- Lettering may nod to these motifs through internal styling only—never add separate ornaments, badges, or backdrop art: ${motifText}.`
+      : `- Echo these motifs: ${motifText}.`
+    : '- Echo these motifs: n/a.';
+  const textOnlyBullets = intent === 'text'
+    ? `- Output must consist solely of the rendered letterforms; keep all other pixels fully transparent.
+- Do not generate plates, ribbons, flourishes, gradients, or shadows that depend on an added background.
+- Maintain clean negative space around the text without inventing extra copy.`
+    : '';
+
+  const roleDirective = intent === 'text'
+    ? `Render only the exact text content supplied below as crisp, legible typography. Do not invent alternate copy, and do not add any containers, icons, illustrations, or decorative frames. The overlay must consist solely of the lettering with every other pixel transparent.`
+    : `Render the described imagery as a decorative element that reads well atop varied backgrounds.`;
+
+  const textDirective = request.textContent
+    ? `Text to render exactly: "${request.textContent}"`
+    : '';
+  const descriptionDirective = request.description ? `Subject description: ${request.description}` : '';
+  const placementDirective = request.placementSummary ? `Placement context: ${request.placementSummary}` : '';
+  const aspectRatioDirective = request.aspectRatioHint ? `Target aspect ratio hint: ${request.aspectRatioHint}` : '';
+  const sizeDirective = request.sizeHint
+    ? `Ideal rendered bounds: about ${request.sizeHint.widthPx ? `${request.sizeHint.widthPx}px wide` : ''}${request.sizeHint.widthPx && request.sizeHint.heightPx ? ' × ' : ''}${request.sizeHint.heightPx ? `${request.sizeHint.heightPx}px tall` : ''}.`
+    : '';
+  const brandDirective = request.brandColors && request.brandColors.length > 0
+    ? `The user's brand palette to honour if possible: ${request.brandColors.join(', ')}.`
+    : '';
+  const accentDirective = accentText ? `Accent palette cues: ${accentText}.` : '';
+  const textureDirective = styleSnapshot.textureSummary ? `Texture guidance: ${styleSnapshot.textureSummary}.` : '';
+  const lightingDirective = styleSnapshot.lightingSummary ? `Lighting guidance: ${styleSnapshot.lightingSummary}.` : '';
+  const notesDirective = styleSnapshot.additionalNotes ? `Additional guardrails: ${styleSnapshot.additionalNotes}.` : '';
+
+  const buildPromptParts = (forceTransparent: boolean) => {
+    const transparencyDirective = forceTransparent
+      ? 'Your previous attempt produced a non-transparent background. Re-render the asset as a PNG with a genuine alpha channel. Trim away all backdrop pixels—checkerboards, solids, gradients, and photographic backplates are forbidden. Do not quit until the background is fully transparent.'
+      : 'Critical: the PNG must keep all pixels outside the artwork fully transparent. Do not include drop shadows that rely on a background rectangle; instead bake soft internal shading if required. No background, no borders, no guidelines. Return just the asset.';
+
+    const promptParts: any[] = [
+      {
+        text: `You are producing a standalone overlay asset for hotspot "${hotspotLabel}". ${roleDirective}
+
+The asset must:
+- Be delivered as a single PNG with a fully transparent background (no residual canvas, no checkerboard fill).
+- Use the template's core palette: ${paletteText || 'n/a'}.
+- Reflect these typography treatments:\n${typographyBullets || '- Keep typography minimal if not provided.'}
+${textOnlyBullets ? `${textOnlyBullets}\n` : ''}${motifBullet}
+- Avoid flattening over the supplied references; treat them only as style cues.
+
+${textDirective}
+${descriptionDirective}
+${placementDirective}
+${brandDirective}
+${sizeDirective}
+${aspectRatioDirective}
+${accentDirective}
+${textureDirective}
+${lightingDirective}
+${notesDirective}
+
+${transparencyDirective}`
+      }
+    ];
+
+    if (request.hotspotCrop) {
+      promptParts.push({ text: 'Style reference crop (do NOT paste directly; study colors, linework, and texture only):' });
+      promptParts.push({ inlineData: { data: request.hotspotCrop.base64, mimeType: request.hotspotCrop.mimeType } });
+    }
+
+    if (request.templateThumbnail) {
+      promptParts.push({ text: 'Overall template reference (for mood only, never to composite with):' });
+      promptParts.push({ inlineData: { data: request.templateThumbnail.base64, mimeType: request.templateThumbnail.mimeType } });
+    }
+
+    return promptParts;
+  };
+
+  const maxAttempts = 2;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const forceTransparent = attempt > 0;
+    let fallbackOpaque: HotspotAssetResult | null = null;
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash-image-preview',
+      contents: { parts: buildPromptParts(forceTransparent) },
+      config: {
+        responseModalities: [Modality.IMAGE, Modality.TEXT],
+        temperature: forceTransparent ? 0.2 : 0.35,
+      },
+    });
+
+    if (!result.candidates || result.candidates.length === 0) {
+      const blockReason = result.promptFeedback?.blockReason;
+      if (blockReason) {
+        throw new Error(`Asset generation blocked: ${blockReason}.`);
+      }
+      throw new Error('Asset generation failed: no candidates returned.');
+    }
+
+    const primaryCandidate = result.candidates[0];
+    const parts = primaryCandidate?.content?.parts ?? [];
+    for (const part of parts) {
+      const data = part.inlineData?.data;
+      const mimeType = part.inlineData?.mimeType || 'image/png';
+      if (!data) {
+        continue;
+      }
+      const hasAlpha = mimeType.includes('png') ? pngHasAlphaChannel(data) : true;
+      if (hasAlpha) {
+        return { base64: data, mimeType, hasAlpha };
+      }
+      fallbackOpaque = { base64: data, mimeType, hasAlpha };
+    }
+
+    if (fallbackOpaque) {
+      if (forceTransparent) {
+        return fallbackOpaque;
+      }
+      // Otherwise retry with stricter prompt in next loop.
+      continue;
+    }
+  }
+
+  throw new Error('Asset generation failed: no image content detected.');
 };
 
 export const getTagsForSearchQuery = async (query: string): Promise<string[]> => {

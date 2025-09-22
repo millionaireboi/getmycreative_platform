@@ -10,7 +10,7 @@ import { firebaseConfig, uploadFileToStorage } from '../firebase/config.ts';
 import { ProfileDropdown } from './Header.tsx';
 import { EditIcon, SparklesIcon, UploadCloudIcon, XIcon, SearchIcon, TrendingUpIcon, EyeIcon, DollarSignIcon, UsersIcon, FileTextIcon, ClockIcon, CheckCircleIcon, AlertTriangleIcon, TrashIcon } from './icons.tsx';
 import { fileToBase64, fileToDataUrl } from '../utils/fileUtils.ts';
-import { detectEditableRegions, generateTemplateMetadata } from '../services/geminiService.ts';
+import { detectEditableRegions, generateTemplateMetadata, generateTemplateStyleSnapshot } from '../services/geminiService.ts';
 
 type StudioTab = 'dashboard' | 'myTemplates' | 'analytics' | 'reviewQueue' | 'userManagement';
 
@@ -275,15 +275,17 @@ export const StudioView = ({ onNavigateToEditor }: StudioViewProps) => {
                     if (shouldAnalyze) {
                         try {
                             // Also analyze the template for metadata and regions
-                            const [marks, metadata] = await Promise.all([
+                            const [marks, metadata, styleSnapshot] = await Promise.all([
                                 detectEditableRegions(base64, file.type),
                                 generateTemplateMetadata(base64, file.type),
+                                generateTemplateStyleSnapshot(base64, file.type),
                             ]);
                             initialData = {
                                 marks,
                                 prompt: metadata.prompt,
                                 tags: metadata.tags,
-                                useCases: metadata.useCases ?? []
+                                useCases: metadata.useCases ?? [],
+                                styleSnapshot,
                             };
                             finalTitle = metadata.title;
                         } catch (analysisError) {
