@@ -576,6 +576,28 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     return { widthPercent, heightPercent };
   };
 
+  const getAssetPlacementRect = useCallback((asset: HotspotAssetPlacement, canvasWidth: number, canvasHeight: number) => {
+    if (canvasWidth <= 0 || canvasHeight <= 0) {
+      return null;
+    }
+    const { widthPercent, heightPercent } = getAssetDisplayMetrics(asset);
+    const widthPx = (widthPercent / 100) * canvasWidth;
+    const heightPx = (heightPercent / 100) * canvasHeight;
+    if (widthPx <= 0 || heightPx <= 0) {
+      return null;
+    }
+    const centerX = clamp(asset.center.x, 0, 1) * canvasWidth;
+    const centerY = clamp(asset.center.y, 0, 1) * canvasHeight;
+    return {
+      widthPx,
+      heightPx,
+      centerX,
+      centerY,
+      leftPx: centerX - widthPx / 2,
+      topPx: centerY - heightPx / 2,
+    };
+  }, [getAssetDisplayMetrics]);
+
   const computeInitialWidthPercent = (mark: Mark, scaleHint = 0.85) => {
     const normalized = mark.width ?? mark.scale ?? 0;
     if (normalized > 0) {
@@ -1277,21 +1299,16 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     ctx.drawImage(baseImage, 0, 0, width, height);
 
     for (const asset of assetEntries) {
-      const { widthPercent, heightPercent } = getAssetDisplayMetrics(asset);
-      const assetWidthPx = (widthPercent / 100) * width;
-      const assetHeightPx = (heightPercent / 100) * height;
-      if (assetWidthPx <= 0 || assetHeightPx <= 0) continue;
-
-      const centerX = clamp(asset.center.x, 0, 1) * width;
-      const centerY = clamp(asset.center.y, 0, 1) * height;
+      const placement = getAssetPlacementRect(asset, width, height);
+      if (!placement) continue;
 
       const assetImage = await loadImageElement(asset.imageUrl);
       ctx.drawImage(
         assetImage,
-        centerX - assetWidthPx / 2,
-        centerY - assetHeightPx / 2,
-        assetWidthPx,
-        assetHeightPx
+        placement.leftPx,
+        placement.topPx,
+        placement.widthPx,
+        placement.heightPx
       );
     }
 
@@ -1306,7 +1323,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     history,
     activeIndex,
     templateImageUrl,
-    getAssetDisplayMetrics,
+    getAssetPlacementRect,
   ]);
 
   const handleRenderComposite = useCallback(async () => {
@@ -2278,12 +2295,13 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                   {Object.values(generatedAssets).map(asset => {
                     const mark = marks.find(m => m.id === asset.markId);
                     if (!mark) return null;
-                    const { widthPercent, heightPercent } = getAssetDisplayMetrics(asset);
+                    const placement = getAssetPlacementRect(asset, imageBounds.width, imageBounds.height);
+                    if (!placement) return null;
                     const style: CSSProperties = {
-                      left: `${clamp(asset.center.x * 100, 0, 100)}%`,
-                      top: `${clamp(asset.center.y * 100, 0, 100)}%`,
-                      width: `${widthPercent}%`,
-                      height: `${heightPercent}%`,
+                      left: `${(placement.centerX / imageBounds.width) * 100}%`,
+                      top: `${(placement.centerY / imageBounds.height) * 100}%`,
+                      width: `${(placement.widthPx / imageBounds.width) * 100}%`,
+                      height: `${(placement.heightPx / imageBounds.height) * 100}%`,
                       transform: 'translate(-50%, -50%)',
                       aspectRatio: asset.aspectRatio || undefined,
                     };
