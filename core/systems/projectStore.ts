@@ -53,7 +53,8 @@ export const createProject = async (userId: string, template: Template): Promise
         history: [{
             id: template.id,
             imageUrl: template.imageUrl,
-            prompt: "Original Template"
+            prompt: "Original Template",
+            initialMarks: template.initialMarks || [],
         }],
         createdAt: Timestamp.fromDate(now),
         updatedAt: Timestamp.fromDate(now),

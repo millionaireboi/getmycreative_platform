@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, ChangeEvent, FormEvent, useRef, MouseEvent, useMemo, MutableRefObject, CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
 import { removeBackground } from '@imgly/background-removal';
 import { UITemplate, BrandAsset, GeneratedImage, Mark, ChatMessage, TemplateStyleSnapshot, TypographyRole } from '../types.ts';
-import { generateCreative, editCreativeWithChat, ChatEditOptions, generateHotspotAsset, generateTemplateStyleSnapshot } from '../services/geminiService.ts';
+import { generateCreative, editCreativeWithChat, ChatEditOptions, generateHotspotAsset, generateTemplateStyleSnapshot, detectEditableRegions } from '../services/geminiService.ts';
 import { fileToBase64, downloadImage, imageUrlToBase64, base64ToBlob } from '../utils/fileUtils.ts';
 import { SparklesIcon, ArrowLeftIcon, DownloadIcon, PaperclipIcon, SendIcon, PaletteIcon, XIcon, UploadCloudIcon, EditIcon, FileTextIcon, ImageIcon } from './icons.tsx';
 import CreativeElement from './CreativeElement.tsx';
@@ -17,6 +17,8 @@ const DEFAULT_HOTSPOT_LABEL: Record<'text' | 'image', string> = {
   text: 'New text hotspot',
   image: 'New image hotspot',
 };
+
+const MAX_HOTSPOT_ANALYSIS_PIXELS = 4_000_000; // ≈ 4 MP cap to balance fidelity and latency
 
 const TYPOGRAPHY_ROLE_OPTIONS: Array<{ value: TypographyRole; label: string; helper: string }> = [
   { value: 'headline', label: 'Headline', helper: 'Bold, primary attention grabber' },
@@ -431,6 +433,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const [activeIndex, setActiveIndex] = useState(Math.max(initialHistory.length - 1, 0));
   const [projectName, setProjectName] = useState(initialName);
   const [isEditingName, setIsEditingName] = useState(false);
+  const [baseMarks, setBaseMarks] = useState<Mark[]>(initialMarksSource);
   const [marks, setMarks] = useState<Mark[]>(initialMarksSource);
   const [enabledMarks, setEnabledMarks] = useState<Record<string, boolean>>(() => {
     const map: Record<string, boolean> = {};
@@ -478,6 +481,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   });
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => buildChatMessagesForState(!!isProUser));
   const [isGenerating, setIsGenerating] = useState(false);
+  const [generationStatus, setGenerationStatus] = useState<string | null>(null);
   const [isGenerationConfirmOpen, setIsGenerationConfirmOpen] = useState(false);
   const [pendingExcludedMarks, setPendingExcludedMarks] = useState<Mark[]>([]);
 
@@ -522,15 +526,15 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const styleSnapshotPromiseRef = useRef<Promise<TemplateStyleSnapshot> | null>(null);
   const templateImageDataRef = useRef<{ base64: string; mimeType: string; width: number; height: number } | null>(null);
   const templateImageElementRef = useRef<HTMLImageElement | null>(null);
+  const lastAppliedVersionIdRef = useRef<string | null>(initialHistory[Math.max(initialHistory.length - 1, 0)]?.id ?? null);
 
-  const originalMarks = useMemo(() => project?.initialMarks ?? pendingTemplate?.initialMarks ?? [], [project, pendingTemplate]);
-  const originalMarksMap = useMemo(() => {
+  const baseMarksMap = useMemo(() => {
     const map: Record<string, Mark> = {};
-    originalMarks.forEach(mark => {
-        map[mark.id] = mark;
+    baseMarks.forEach(mark => {
+      map[mark.id] = mark;
     });
     return map;
-  }, [originalMarks]);
+  }, [baseMarks]);
 
   const updateMarkLabel = useCallback((markId: string, nextLabel: string) => {
     setMarks(prev => prev.map(mark => {
@@ -584,7 +588,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
       const textRaw = overrides?.text !== undefined ? overrides.text ?? '' : textFields[markId] ?? '';
       const trimmed = textRaw.trim();
       if (!trimmed) return false;
-      const originalTrimmed = (originalMarksMap[markId]?.text ?? '').trim();
+      const originalTrimmed = (baseMarksMap[markId]?.text ?? '').trim();
       if (!mark.isNew && originalTrimmed && trimmed === originalTrimmed) {
         return false;
       }
@@ -599,7 +603,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
     const promptRaw = overrides?.prompt !== undefined ? overrides.prompt ?? '' : imagePrompts[markId] ?? '';
     return promptRaw.trim().length > 0;
-  }, [marks, textFields, imageAssets, imagePrompts, imageModes, originalMarksMap]);
+  }, [marks, textFields, imageAssets, imagePrompts, imageModes, baseMarksMap]);
 
   const applyMarkEnabledFromContent = useCallback((markId: string, overrides?: {
     label?: string;
@@ -613,6 +617,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
   const applyMarksFromSource = useCallback((sourceMarks: Mark[]) => {
     const normalizedMarks = sourceMarks.map(withInferredTypographyRole);
+    setBaseMarks(normalizedMarks);
     setMarks(normalizedMarks);
     setEnabledMarks(() => {
         const map: Record<string, boolean> = {};
@@ -671,6 +676,51 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
       img.onerror = reject;
       img.src = toDataUrl(base64, mimeType);
     });
+
+  const downscaleToMaxPixels = useCallback(async ({
+    base64,
+    mimeType,
+    width,
+    height,
+    maxPixels = MAX_HOTSPOT_ANALYSIS_PIXELS,
+  }: {
+    base64: string;
+    mimeType: string;
+    width: number;
+    height: number;
+    maxPixels?: number;
+  }): Promise<{ base64: string; mimeType: string; width: number; height: number }> => {
+    if (!base64 || width <= 0 || height <= 0) {
+      return { base64, mimeType, width, height };
+    }
+
+    const totalPixels = width * height;
+    if (!Number.isFinite(totalPixels) || totalPixels <= maxPixels) {
+      return { base64, mimeType, width, height };
+    }
+
+    const scale = Math.sqrt(maxPixels / totalPixels);
+    const targetWidth = Math.max(1, Math.round(width * scale));
+    const targetHeight = Math.max(1, Math.round(height * scale));
+
+    const dataUrl = toDataUrl(base64, mimeType);
+    const img = await loadImageElement(dataUrl);
+    const canvas = document.createElement('canvas');
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return { base64, mimeType, width, height };
+    }
+    ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+    const fallbackMime = mimeType.includes('jpeg') || mimeType.includes('jpg') || mimeType.includes('webp')
+      ? 'image/jpeg'
+      : 'image/png';
+    const scaledDataUrl = canvas.toDataURL(fallbackMime);
+    const scaledBase64 = scaledDataUrl.split(',')[1] ?? scaledDataUrl;
+    return { base64: scaledBase64, mimeType: fallbackMime, width: targetWidth, height: targetHeight };
+  }, [toDataUrl]);
 
   const ensureTemplateImageData = useCallback(async () => {
     if (templateImageDataRef.current) {
@@ -1080,6 +1130,33 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   }, [activeImageUrl, updateImageBounds]);
 
   useEffect(() => {
+    const activeVersion = history[activeIndex];
+    if (!activeVersion) {
+      return;
+    }
+    if (lastAppliedVersionIdRef.current === activeVersion.id) {
+      setTemplateImageUrl(activeVersion.imageUrl);
+      return;
+    }
+
+    const hasStoredMarks = Array.isArray(activeVersion.initialMarks);
+    if (hasStoredMarks) {
+      applyMarksFromSource(activeVersion.initialMarks ?? []);
+    } else if (activeIndex === 0) {
+      const fallback = project?.initialMarks ?? pendingTemplate?.initialMarks ?? [];
+      if (fallback.length > 0) {
+        applyMarksFromSource(fallback);
+      }
+    }
+
+    setTemplateImageUrl(activeVersion.imageUrl);
+    baseStyleImageRef.current = activeVersion.imageUrl;
+    templateImageDataRef.current = null;
+    templateImageElementRef.current = null;
+    lastAppliedVersionIdRef.current = activeVersion.id;
+  }, [activeIndex, history, applyMarksFromSource, project?.initialMarks, pendingTemplate?.initialMarks]);
+
+  useEffect(() => {
     const frame = requestAnimationFrame(() => updateImageBounds());
     return () => cancelAnimationFrame(frame);
   }, [canvasScale, canvasOffset.x, canvasOffset.y, updateImageBounds]);
@@ -1124,21 +1201,28 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setIsPlacingMark(null);
     setChatMessages(buildChatMessagesForState(!!isProUser));
     lastHydratedRef.current = { projectId: null, templateId: template.id };
+    lastAppliedVersionIdRef.current = template.id;
   }, [applyMarksFromSource, closeMentionSuggestions, isProUser]);
 
   const hydrateFromProject = useCallback((source: Project) => {
     const projectHistory: GeneratedImage[] = source.history && source.history.length > 0
         ? source.history
-        : [{ id: source.templateId, imageUrl: source.templateImageUrl, prompt: 'Original Template' }];
+        : [{ id: source.templateId, imageUrl: source.templateImageUrl, prompt: 'Original Template', initialMarks: source.initialMarks ?? [] }];
     setHistory(projectHistory);
     setActiveIndex(Math.max(projectHistory.length - 1, 0));
     const name = source.name ?? 'Untitled Project';
     setProjectName(name);
     setInitialProjectName(name);
     setIsEditingName(false);
-    applyMarksFromSource(source.initialMarks ?? []);
+    const lastImage = projectHistory[Math.max(projectHistory.length - 1, 0)] ?? null;
+    const sourceMarks = lastImage?.initialMarks ?? source.initialMarks ?? [];
+    if (sourceMarks.length > 0) {
+      applyMarksFromSource(sourceMarks);
+    } else {
+      applyMarksFromSource([]);
+    }
     setBasePrompt(source.basePrompt ?? '');
-    setTemplateImageUrl(source.templateImageUrl ?? '');
+    setTemplateImageUrl(lastImage?.imageUrl ?? source.templateImageUrl ?? '');
     setTemplateId(source.templateId ?? '');
     setPersistedProjectId(source.id);
     templateRef.current = null;
@@ -1153,6 +1237,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setIsPlacingMark(null);
     setChatMessages(buildChatMessagesForState(!!isProUser));
     lastHydratedRef.current = { projectId: source.id, templateId: null };
+    lastAppliedVersionIdRef.current = lastImage?.id ?? source.templateId ?? null;
   }, [applyMarksFromSource, closeMentionSuggestions, isProUser]);
 
   useEffect(() => {
@@ -1284,6 +1369,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setIsGenerationConfirmOpen(false);
     setPendingExcludedMarks([]);
     setIsGenerating(true);
+    setGenerationStatus('Generating creative…');
     setIsChatDrawerOpen(true);
     setChatMessages(prev => prev.filter(m => m.type !== 'error'));
 
@@ -1297,6 +1383,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
       };
       setChatMessages(prev => [...prev, infoMessage]);
       setIsGenerating(false);
+      setGenerationStatus(null);
       return;
     }
 
@@ -1328,6 +1415,10 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
       const updates: string[] = [];
       let latestBaseImageUrl = templateImageUrl;
+      let newCreativeId: string | null = null;
+      let historyAfterUpload: GeneratedImage[] | null = null;
+      let normalizedDetectedMarks: Mark[] | null = null;
+      let analysisMessageId: string | null = null;
 
       if (existingMarks.length > 0) {
         const enabledForGeneration: Record<string, boolean> = {};
@@ -1346,7 +1437,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
           imageModes,
           enabledForGeneration,
           marks,
-          originalMarks,
+          baseMarks,
           {
             canvasDimensions: { width: templateWidth, height: templateHeight },
             overlayTextMarkIds: existingOverlayTextMarkIds,
@@ -1356,16 +1447,16 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         const imageBlob = base64ToBlob(resultBase64, 'image/png');
         const newImageUrl = await uploadFileToStorage(imageBlob, `projects/${appUser.id}/generated`);
 
-        const newCreative: GeneratedImage = {
-          id: `gen-${Date.now()}`,
+        newCreativeId = `gen-${Date.now()}`;
+        const newCreativeBase: GeneratedImage = {
+          id: newCreativeId,
           imageUrl: newImageUrl,
           prompt: basePrompt,
         };
 
-        const updatedHistory = [...history, newCreative];
-        setHistory(updatedHistory);
-        setActiveIndex(updatedHistory.length - 1);
-        await ensureProjectPersisted(updatedHistory);
+        historyAfterUpload = [...history, newCreativeBase];
+        setHistory(historyAfterUpload);
+        setActiveIndex(historyAfterUpload.length - 1);
         latestBaseImageUrl = newImageUrl;
 
         updates.push(existingMarks.length > 1
@@ -1536,6 +1627,62 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         }
       }
 
+      if (newCreativeId && historyAfterUpload) {
+        try {
+          setGenerationStatus('Analyzing new creative…');
+          analysisMessageId = `msg-ai-${Date.now()}`;
+          setChatMessages(prev => [...prev, {
+            id: analysisMessageId!,
+            role: 'assistant',
+            type: 'text',
+            text: 'Analyzing the new creative for editable hotspots…',
+          }]);
+
+          const generatedEntry = historyAfterUpload[historyAfterUpload.length - 1];
+          const { base64: newBase64, mimeType: newMimeType, width: newWidth, height: newHeight } = await imageUrlToBase64(generatedEntry.imageUrl);
+          const scaled = await downscaleToMaxPixels({ base64: newBase64, mimeType: newMimeType, width: newWidth, height: newHeight });
+          const detectedMarks = await detectEditableRegions(scaled.base64, scaled.mimeType);
+          normalizedDetectedMarks = detectedMarks.map(withInferredTypographyRole);
+          applyMarksFromSource(normalizedDetectedMarks);
+
+          const summary = `Analyzed the new creative and detected ${normalizedDetectedMarks.length} hotspot${normalizedDetectedMarks.length === 1 ? '' : 's'}.`;
+          updates.push(summary);
+          if (analysisMessageId) {
+            setChatMessages(prev => prev.map(msg => msg.id === analysisMessageId ? { ...msg, text: summary } : msg));
+          }
+        } catch (analysisError) {
+          console.error('Hotspot detection failed:', analysisError);
+          const failureMessage = 'Generated the creative, but hotspot detection failed. Previous hotspots remain active.';
+          updates.push(failureMessage);
+          if (analysisMessageId) {
+            setChatMessages(prev => prev.map(msg => msg.id === analysisMessageId
+              ? { ...msg, type: 'error', text: failureMessage }
+              : msg));
+          } else {
+            const errorMsg: ChatMessage = { id: `err-${Date.now()}`, role: 'assistant', type: 'error', text: failureMessage };
+            setChatMessages(prev => [...prev, errorMsg]);
+          }
+        } finally {
+          setGenerationStatus('Wrapping up…');
+        }
+      } else {
+        setGenerationStatus('Wrapping up…');
+      }
+
+      if (newCreativeId && historyAfterUpload) {
+        const latestEntry = historyAfterUpload[historyAfterUpload.length - 1];
+        const finalEntry: GeneratedImage = normalizedDetectedMarks
+          ? { ...latestEntry, initialMarks: normalizedDetectedMarks }
+          : latestEntry;
+        const historyWithFinal = [...historyAfterUpload];
+        historyWithFinal[historyWithFinal.length - 1] = finalEntry;
+        setHistory(historyWithFinal);
+        setActiveIndex(historyWithFinal.length - 1);
+        lastAppliedVersionIdRef.current = finalEntry.id;
+        await ensureProjectPersisted(historyWithFinal);
+        setTemplateImageUrl(finalEntry.imageUrl);
+      }
+
       const assistantMessage: ChatMessage = {
         id: `msg-ai-${Date.now()}`,
         role: 'assistant',
@@ -1555,6 +1702,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
       setChatMessages(prev => [...prev, errorMsg]);
     } finally {
       setIsGenerating(false);
+      setGenerationStatus(null);
     }
   }, [
     appUser,
@@ -1567,8 +1715,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     imagePrompts,
     imageModes,
     marks,
-    originalMarks,
-    originalMarksMap,
+    baseMarks,
+    baseMarksMap,
     history,
     getAssetSignature,
     generatedAssets,
@@ -1577,6 +1725,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     buildHotspotSummary,
     computeAspectRatioHint,
     captureHotspotCrop,
+    downscaleToMaxPixels,
+    applyMarksFromSource,
   ]);
 
   const handleGenerateClick = useCallback(() => {
@@ -2047,7 +2197,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
               disabled ? 'bg-emerald-500/60 text-white/80 cursor-not-allowed' : 'bg-emerald-500 text-white hover:bg-emerald-400'
             }`}
           >
-            {isGenerating ? 'Generating…' : (<><SparklesIcon className="h-5 w-5" />Generate creative</>)}
+            {isGenerating ? (generationStatus ?? 'Generating…') : (<><SparklesIcon className="h-5 w-5" />Generate creative</>)}
           </button>
           <button
             onClick={handleRenderComposite}
@@ -2073,7 +2223,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     const mode = imageModes[markId] || 'upload';
     const currentAsset = imageAssets[markId] || null;
     const currentPrompt = imagePrompts[markId] || '';
-    const originalMark = originalMarksMap[markId];
+    const originalMark = baseMarksMap[markId];
     const originalText = originalMark?.text || '';
     const displayLabel = resolveHotspotDisplayLabel(activeMark);
     const labelPending = isHotspotLabelPending(activeMark);
@@ -2523,10 +2673,13 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                     {isGenerating && (
                         <div className="flex gap-3 text-sm text-gray-500">
                             <div className="flex h-7 w-7 items-center justify-center rounded-full bg-emerald-100"><SparklesIcon className="h-4 w-4 text-emerald-500 animate-spin" /></div>
-                            <div className="flex items-center gap-1">
-                                <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" style={{ animationDelay: '0s' }}></span>
-                                <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" style={{ animationDelay: '0.15s' }}></span>
-                                <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" style={{ animationDelay: '0.3s' }}></span>
+                            <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-1">
+                                    <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" style={{ animationDelay: '0s' }}></span>
+                                    <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" style={{ animationDelay: '0.15s' }}></span>
+                                    <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" style={{ animationDelay: '0.3s' }}></span>
+                                </div>
+                                <span>{generationStatus ?? 'Working on it…'}</span>
                             </div>
                         </div>
                     )}

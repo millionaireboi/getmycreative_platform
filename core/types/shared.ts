@@ -13,6 +13,7 @@ export interface GeneratedImage {
   id: string;
   imageUrl: string;
   prompt: string;
+  initialMarks?: Mark[]; // Hotspot snapshot captured when this version was rendered
 }
 
 export type MarkCategory = 'content' | 'decorative' | 'silhouette' | 'background';
