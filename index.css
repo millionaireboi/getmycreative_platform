@@ -15,6 +15,25 @@ body {
   @apply bg-slate-100;
 }
 
+@keyframes proShimmer {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+.pro-badge {
+  background: linear-gradient(120deg, #fde68a, #f97316, #fde68a);
+  background-size: 200% 200%;
+  animation: proShimmer 2.5s linear infinite;
+  box-shadow: 0 6px 18px rgba(249, 115, 22, 0.35);
+}
+
 .creative-element {
   position: absolute;
   inset: 0;

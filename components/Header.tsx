@@ -1,9 +1,38 @@
 import React, { useState } from 'react';
 import { useAuth } from '../contexts/AuthContext.tsx';
-import { UserIcon, SparklesIcon, PaletteIcon, HomeIcon, EditIcon, LogOutIcon } from './icons.tsx';
+import { UserIcon, SparklesIcon, PaletteIcon, HomeIcon, EditIcon, LogOutIcon, CrownIcon } from './icons.tsx';
 import { handleLogout } from '../core/systems/auth.ts';
 import { can } from '../core/systems/rbac.ts';
 import { SubscriptionTier, UserRole } from '../core/types/index.ts';
+
+const Avatar = ({
+    photoURL,
+    isProCustomer,
+    className = 'w-8 h-8',
+}: {
+    photoURL?: string | null;
+    isProCustomer: boolean;
+    className?: string;
+}) => (
+    <div className={`relative ${className}`}>
+        {photoURL ? (
+            <img
+                src={photoURL}
+                alt="User"
+                className="w-full h-full rounded-full object-cover border border-amber-200/60"
+            />
+        ) : (
+            <div className="w-full h-full rounded-full bg-slate-200 flex items-center justify-center">
+                <UserIcon className="w-5 h-5 text-slate-500" />
+            </div>
+        )}
+        {isProCustomer && (
+            <span className="absolute -top-4 left-1/2 -translate-x-1/2 pointer-events-none drop-shadow-sm">
+                <CrownIcon className="w-5 h-5 text-amber-400" />
+            </span>
+        )}
+    </div>
+);
 
 export const ProfileDropdown = () => {
     const { appUser } = useAuth();
@@ -11,15 +40,16 @@ export const ProfileDropdown = () => {
 
     if (!appUser) return null;
 
+    const isProCustomer = appUser.role === UserRole.CUSTOMER && appUser.tier === SubscriptionTier.PRO;
+
     return (
         <div className="relative">
             <button onClick={() => setIsOpen(!isOpen)} className="flex items-center gap-2">
-                {appUser.photoURL ? (
-                    <img src={appUser.photoURL} alt="User" className="w-8 h-8 rounded-full" />
-                ) : (
-                    <div className="w-8 h-8 rounded-full bg-slate-200 flex items-center justify-center">
-                        <UserIcon className="w-5 h-5 text-slate-500" />
-                    </div>
+                <Avatar photoURL={appUser.photoURL} isProCustomer={isProCustomer} />
+                {isProCustomer && (
+                    <span className="pro-badge px-2 py-0.5 text-xs font-semibold uppercase tracking-wide text-white rounded-full shadow-sm">
+                        Pro
+                    </span>
                 )}
             </button>
             {isOpen && (
@@ -53,6 +83,7 @@ export const Header = ({ onLoginClick, onUpgradeClick, onBrandKitClick, onHomeCl
   const { appUser } = useAuth();
   
   const canAccessStudio = can(appUser, 'create', 'template') || can(appUser, 'manage', 'systemSettings');
+  const isProCustomer = appUser?.role === UserRole.CUSTOMER && appUser?.tier === SubscriptionTier.PRO;
 
   return (
     <header className="bg-white/80 backdrop-blur-sm border-b border-slate-200 sticky top-0 z-20">
@@ -97,7 +128,7 @@ export const Header = ({ onLoginClick, onUpgradeClick, onBrandKitClick, onHomeCl
                             Designer
                         </span>
                       )}
-                       {appUser.tier === SubscriptionTier.PRO && (
+                       {appUser.tier === SubscriptionTier.PRO && appUser.role !== UserRole.CUSTOMER && (
                         <span className="px-2 py-0.5 text-xs font-semibold text-emerald-800 bg-emerald-100 rounded-full">
                             Pro Plan
                         </span>
@@ -109,13 +140,14 @@ export const Header = ({ onLoginClick, onUpgradeClick, onBrandKitClick, onHomeCl
                       )}
                     </div>
                   </div>
-                  {appUser.photoURL ? (
-                    <img src={appUser.photoURL} alt="User" className="w-8 h-8 rounded-full" />
-                  ) : (
-                    <div className="w-8 h-8 rounded-full bg-slate-200 flex items-center justify-center">
-                        <UserIcon className="w-5 h-5 text-slate-500" />
-                    </div>
-                  )}
+                  <div className="flex items-center gap-2">
+                    <Avatar photoURL={appUser.photoURL} isProCustomer={!!isProCustomer} />
+                    {isProCustomer && (
+                      <span className="pro-badge px-2 py-0.5 text-xs font-semibold uppercase tracking-wide text-white rounded-full shadow-sm">
+                          Pro
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 <button

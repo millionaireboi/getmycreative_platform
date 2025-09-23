@@ -98,6 +98,24 @@ export const UserIcon = ({ className }: { className?: string }) => (
     </svg>
 );
 
+export const CrownIcon = ({ className }: { className?: string }) => (
+    <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="currentColor"
+        className={`block ${className || ''}`}
+    >
+        <path d="M2 7.5 6.5 9.75 9.5 5l2.5 3.5L14.5 5l3 4.75L22 7.5 19.5 19h-15L2 7.5Z" />
+        <path
+            d="M7 19c0 1.657 2.686 3 6 3s6-1.343 6-3"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+        />
+    </svg>
+);
+
 export const XIcon = ({ className }: { className?: string }) => (
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`block ${className || ''}`}>
         <line x1="18" y1="6" x2="6" y2="18"></line>
