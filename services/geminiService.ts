@@ -27,6 +27,15 @@ type PlacementGeometry = {
 // Prefer Vite-style env var; fall back to legacy define for compatibility.
 const API_KEY = (import.meta as any).env?.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
 
+const GENERATIVE_FILL_FLAG = (import.meta as any).env?.VITE_ENABLE_VERTEX_GENERATIVE_FILL
+  ?? process.env.VITE_ENABLE_VERTEX_GENERATIVE_FILL
+  ?? process.env.ENABLE_VERTEX_GENERATIVE_FILL;
+
+const GENERATIVE_FILL_SUPPORTED = String(GENERATIVE_FILL_FLAG).toLowerCase() === 'true';
+const GENERATIVE_FILL_ENDPOINT = (import.meta as any).env?.VITE_GENERATIVE_FILL_ENDPOINT
+  ?? process.env.VITE_GENERATIVE_FILL_ENDPOINT
+  ?? '/api/generative-fill';
+
 const ALLOWED_TYPOGRAPHY_ROLES: TypographyRole[] = ['headline', 'subheading', 'body', 'caption', 'accent', 'decorative'];
 const ALLOWED_MARK_CATEGORIES: MarkCategory[] = ['content', 'decorative', 'silhouette', 'background'];
 
@@ -245,6 +254,8 @@ const getAi = (): GoogleGenAI => {
 
 export const getGeminiClient = (): GoogleGenAI => getAi();
 
+export const isGenerativeFillConfigured = (): boolean => GENERATIVE_FILL_SUPPORTED;
+
 export interface EditToggles {
   [markId: string]: boolean;
 }
@@ -275,6 +286,19 @@ export interface HotspotAssetResult {
   base64: string;
   mimeType: string;
   hasAlpha: boolean;
+}
+
+export interface GenerativeFillRequest {
+  baseImageBase64: string;
+  baseImageMimeType: string;
+  maskBase64: string;
+  prompt: string;
+  brandColors?: string[];
+}
+
+export interface GenerativeFillResult {
+  base64: string;
+  mimeType: string;
 }
 
 
@@ -1311,6 +1335,47 @@ ${transparencyDirective}`
   }
 
   throw new Error('Asset generation failed: no image content detected.');
+};
+
+export const generativeFill = async (request: GenerativeFillRequest): Promise<GenerativeFillResult> => {
+  if (!GENERATIVE_FILL_SUPPORTED) {
+    throw new Error('Generative fill requires Vertex AI credentials. Configure the backend proxy and set VITE_ENABLE_VERTEX_GENERATIVE_FILL=true.');
+  }
+  const prompt = request.prompt.trim();
+  if (!prompt) {
+    throw new Error('Describe what you want the generative fill to create.');
+  }
+  if (!request.maskBase64) {
+    throw new Error('A selection mask is required to run generative fill.');
+  }
+
+  const response = await fetch(GENERATIVE_FILL_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      baseImageBase64: request.baseImageBase64,
+      baseImageMimeType: request.baseImageMimeType,
+      maskBase64: request.maskBase64,
+      prompt,
+      brandColors: request.brandColors,
+    }),
+  });
+
+  const result = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = result?.error || result?.message || `Generative fill failed with status ${response.status}.`;
+    throw new Error(message);
+  }
+
+  const base64 = result?.base64;
+  const mimeType = result?.mimeType || 'image/png';
+  if (typeof base64 !== 'string' || base64.length === 0) {
+    throw new Error(result?.error || 'Generative fill failed: no image returned by the server.');
+  }
+
+  return { base64, mimeType };
 };
 
 export const getTagsForSearchQuery = async (query: string): Promise<string[]> => {

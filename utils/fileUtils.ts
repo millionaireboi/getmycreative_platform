@@ -29,6 +29,25 @@ export const fileToDataUrl = (file: File): Promise<string> => {
     });
 };
 
+export const blobToBase64 = (blob: Blob): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(blob);
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result !== 'string') {
+        reject(new Error('Failed to convert blob to base64.'));
+        return;
+      }
+      const [, base64] = result.split(',');
+      resolve(base64 ?? result);
+    };
+    reader.onerror = () => {
+      reject(reader.error || new Error('Failed to read blob as base64.'));
+    };
+  });
+};
+
 export const downloadImage = (imageUrl: string, fileName: string, watermarkText?: string) => {
   if (!watermarkText) {
     const link = document.createElement('a');

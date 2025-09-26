@@ -1,8 +1,8 @@
 import { useState, useCallback, useEffect, ChangeEvent, FormEvent, useRef, MouseEvent, useMemo, MutableRefObject, CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
 import { removeBackground } from '@imgly/background-removal';
 import { UITemplate, BrandAsset, GeneratedImage, Mark, ChatMessage, TemplateStyleSnapshot, TypographyRole } from '../types.ts';
-import { generateCreative, editCreativeWithChat, ChatEditOptions, generateHotspotAsset, generateTemplateStyleSnapshot, detectEditableRegions } from '../services/geminiService.ts';
-import { fileToBase64, downloadImage, imageUrlToBase64, base64ToBlob } from '../utils/fileUtils.ts';
+import { generateCreative, editCreativeWithChat, ChatEditOptions, generateHotspotAsset, generateTemplateStyleSnapshot, detectEditableRegions, generativeFill, isGenerativeFillConfigured } from '../services/geminiService.ts';
+import { fileToBase64, downloadImage, imageUrlToBase64, base64ToBlob, blobToBase64 } from '../utils/fileUtils.ts';
 import { SparklesIcon, ArrowLeftIcon, DownloadIcon, PaperclipIcon, SendIcon, PaletteIcon, XIcon, UploadCloudIcon, EditIcon, FileTextIcon, ImageIcon } from './icons.tsx';
 import CreativeElement from './CreativeElement.tsx';
 
@@ -43,6 +43,25 @@ const isHotspotLabelPending = (mark: Mark): boolean => {
 };
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+const computeNormalizedPolygonArea = (points: Array<{ x: number; y: number }>): number => {
+  if (points.length < 3) {
+    return 0;
+  }
+  let area = 0;
+  for (let index = 0; index < points.length; index += 1) {
+    const current = points[index];
+    const next = points[(index + 1) % points.length];
+    area += current.x * next.y - next.x * current.y;
+  }
+  return Math.abs(area) / 2;
+};
+
+const toClipPathPolygon = (points: Array<{ x: number; y: number }>): string => {
+  return points
+    .map(point => `${(point.x * 100).toFixed(2)}% ${(point.y * 100).toFixed(2)}%`)
+    .join(', ');
+};
 
 const inferTypographyRoleFromLabel = (label: string): TypographyRole | null => {
   const value = (label || '').toLowerCase();
@@ -511,6 +530,12 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const [showHotspotOverlay, setShowHotspotOverlay] = useState(true);
   const [isDrawingMark, setIsDrawingMark] = useState(false);
   const [draftMark, setDraftMark] = useState<Mark | null>(null);
+  const [isDrawingFill, setIsDrawingFill] = useState(false);
+  const [draftFillMask, setDraftFillMask] = useState<Blob | null>(null);
+  const [fillPrompt, setFillPrompt] = useState('');
+  const [fillPath, setFillPath] = useState<Array<{ x: number; y: number }>>([]);
+  const [fillRegion, setFillRegion] = useState<Array<{ x: number; y: number }>>([]);
+  const generativeFillSupported = useMemo(() => isGenerativeFillConfigured(), []);
 
   const [basePrompt, setBasePrompt] = useState(initialPrompt);
   const [templateImageUrl, setTemplateImageUrl] = useState(initialTemplateImageUrl);
@@ -814,6 +839,52 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     return { base64, mimeType: 'image/png' };
   }, [ensureTemplateImageData, ensureTemplateImageElement]);
 
+  const buildFillMaskFromPath = useCallback(async (points: Array<{ x: number; y: number }>): Promise<Blob> => {
+    if (points.length < 3) {
+      throw new Error('Select a larger area before applying generative fill.');
+    }
+
+    const normalizedArea = computeNormalizedPolygonArea(points);
+    if (normalizedArea < 0.0002) {
+      throw new Error('The selected fill region is too small. Try drawing a larger shape.');
+    }
+
+    const baseImage = await ensureTemplateImageData();
+    const canvas = document.createElement('canvas');
+    canvas.width = baseImage.width;
+    canvas.height = baseImage.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      throw new Error('Unable to prepare a mask canvas for generative fill.');
+    }
+
+    ctx.fillStyle = 'black';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = 'white';
+    ctx.beginPath();
+    points.forEach((point, index) => {
+      const x = clamp(point.x, 0, 1) * canvas.width;
+      const y = clamp(point.y, 0, 1) * canvas.height;
+      if (index === 0) {
+        ctx.moveTo(x, y);
+      } else {
+        ctx.lineTo(x, y);
+      }
+    });
+    ctx.closePath();
+    ctx.fill();
+
+    return await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(blob => {
+        if (!blob) {
+          reject(new Error('Failed to convert fill selection into a mask.'));
+          return;
+        }
+        resolve(blob);
+      }, 'image/png');
+    });
+  }, [ensureTemplateImageData]);
+
   const ensureStyleSnapshot = useCallback(async (): Promise<TemplateStyleSnapshot> => {
     if (styleSnapshot) {
       return styleSnapshot;
@@ -1035,6 +1106,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   const canvasHotspotRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const lastFocusedHotspotIdRef = useRef<string | null>(null);
   const drawStartRef = useRef<{ x: number; y: number; id: string; label: string } | null>(null);
+  const fillDrawingActiveRef = useRef(false);
+  const fillPathRef = useRef<Array<{ x: number; y: number }>>([]);
   const drawerLabelInputRef = useRef<HTMLInputElement | null>(null);
   const drawerIncludeButtonRef = useRef<HTMLButtonElement | null>(null);
   const drawerTextAreaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1047,6 +1120,26 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     widthPercent: number;
     heightPercent: number;
   } | null>(null);
+
+  const resetFillDrawingState = useCallback(() => {
+    fillDrawingActiveRef.current = false;
+    fillPathRef.current = [];
+    setFillPath([]);
+  }, []);
+
+  const clearFillSelection = useCallback(() => {
+    resetFillDrawingState();
+    setFillRegion([]);
+    setDraftFillMask(null);
+    setFillPrompt('');
+  }, [resetFillDrawingState]);
+
+  useEffect(() => {
+    if (!generativeFillSupported) {
+      clearFillSelection();
+      setIsDrawingFill(false);
+    }
+  }, [generativeFillSupported, clearFillSelection]);
 
   const handleAssetPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>, asset: HotspotAssetPlacement) => {
     event.preventDefault();
@@ -1118,6 +1211,13 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     if (!activeHotspotId) return null;
     return marks.find(m => m.id === activeHotspotId) || null;
   }, [activeHotspotId, marks]);
+
+  const generativeFillButtonDisabled = !generativeFillSupported;
+  const generativeFillButtonClasses = generativeFillButtonDisabled
+    ? 'border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed'
+    : isDrawingFill
+      ? 'border-emerald-500 bg-emerald-500 text-white shadow-sm'
+      : 'border-slate-200 bg-white text-gray-700 hover:bg-slate-100';
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => updateImageBounds());
@@ -1369,12 +1469,15 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setChatMessages(prev => prev.filter(m => m.type !== 'error'));
 
     const readyMarks = readyIncludedMarks;
-    if (readyMarks.length === 0) {
+    const fillPromptText = fillPrompt.trim();
+    const hasFillRequest = generativeFillSupported && !!draftFillMask && fillPromptText.length > 0;
+
+    if (!hasFillRequest && readyMarks.length === 0) {
       const infoMessage: ChatMessage = {
         id: `msg-ai-${Date.now()}`,
         role: 'assistant',
         type: 'text',
-        text: 'Select and fill at least one hotspot before generating.',
+        text: 'Draw a generative-fill selection or include at least one hotspot before generating.',
       };
       setChatMessages(prev => [...prev, infoMessage]);
       setIsGenerating(false);
@@ -1382,11 +1485,19 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
       return;
     }
 
+    const requestSummary: string[] = [];
+    if (hasFillRequest) {
+      requestSummary.push('Apply the generative fill selection.');
+    }
+    if (readyMarks.length > 0) {
+      requestSummary.push('Generate the creative with the hotspots I selected.');
+    }
+
     const userMessage: ChatMessage = {
       id: `msg-${Date.now()}`,
       role: 'user',
       type: 'text',
-      text: 'Generate the creative with the hotspots I selected.'
+      text: requestSummary.join(' ')
     };
     setChatMessages(prev => {
       const withoutTip = prev.filter(m => m.id !== 'msg-tip');
@@ -1394,7 +1505,9 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     });
 
     try {
-      const { base64: templateBase64, mimeType: templateMimeType, width: templateWidth, height: templateHeight } = await imageUrlToBase64(templateImageUrl);
+      const baseImageUrlForRun = hasFillRequest ? activeImageUrl : templateImageUrl;
+      let { base64: templateBase64, mimeType: templateMimeType, width: templateWidth, height: templateHeight } = await imageUrlToBase64(baseImageUrlForRun);
+      const seedHistory = history.slice(0, activeIndex + 1);
 
       const existingMarks = readyMarks.filter(mark => !mark.isNew);
 
@@ -1409,11 +1522,41 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
       const existingOverlayTextMarkIds: string[] = [];
 
       const updates: string[] = [];
-      let latestBaseImageUrl = templateImageUrl;
+      let latestBaseImageUrl = baseImageUrlForRun;
       let newCreativeId: string | null = null;
       let historyAfterUpload: GeneratedImage[] | null = null;
       let normalizedDetectedMarks: Mark[] | null = null;
       let analysisMessageId: string | null = null;
+
+      if (hasFillRequest && draftFillMask) {
+        setGenerationStatus('Applying generative fill…');
+        const maskBase64 = await blobToBase64(draftFillMask);
+        const fillResult = await generativeFill({
+          baseImageBase64: templateBase64,
+          baseImageMimeType: templateMimeType,
+          maskBase64,
+          prompt: fillPromptText,
+          brandColors: brandColors.length > 0 ? brandColors : undefined,
+        });
+
+        const fillBlob = base64ToBlob(fillResult.base64, fillResult.mimeType);
+        const fillUrl = await uploadFileToStorage(fillBlob, `projects/${appUser.id}/generated`);
+        const fillEntry: GeneratedImage = {
+          id: `fill-${Date.now()}`,
+          imageUrl: fillUrl,
+          prompt: fillPromptText,
+        };
+
+        historyAfterUpload = [...seedHistory, fillEntry];
+        setHistory(historyAfterUpload);
+        setActiveIndex(historyAfterUpload.length - 1);
+
+        templateBase64 = fillResult.base64;
+        templateMimeType = fillResult.mimeType;
+        latestBaseImageUrl = fillUrl;
+        newCreativeId = fillEntry.id;
+        updates.push('Applied your generative fill selection.');
+      }
 
       if (existingMarks.length > 0) {
         const enabledForGeneration: Record<string, boolean> = {};
@@ -1449,7 +1592,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
           prompt: basePrompt,
         };
 
-        historyAfterUpload = [...history, newCreativeBase];
+        const priorHistory = historyAfterUpload ?? seedHistory;
+        historyAfterUpload = [...priorHistory, newCreativeBase];
         setHistory(historyAfterUpload);
         setActiveIndex(historyAfterUpload.length - 1);
         latestBaseImageUrl = newImageUrl;
@@ -1678,6 +1822,10 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         setTemplateImageUrl(finalEntry.imageUrl);
       }
 
+      if (hasFillRequest) {
+        clearFillSelection();
+      }
+
       const assistantMessage: ChatMessage = {
         id: `msg-ai-${Date.now()}`,
         role: 'assistant',
@@ -1704,6 +1852,8 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     readyIncludedMarks,
     ensureProjectPersisted,
     templateImageUrl,
+    activeImageUrl,
+    activeIndex,
     basePrompt,
     textFields,
     imageAssets,
@@ -1722,18 +1872,42 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     captureHotspotCrop,
     downscaleToMaxPixels,
     applyMarksFromSource,
+    draftFillMask,
+    fillPrompt,
+    generativeFill,
+    blobToBase64,
+    clearFillSelection,
   ]);
 
   const handleGenerateClick = useCallback(() => {
     if (isGenerating || isDemoMode) return;
-    const excluded = marks.filter(mark => !enabledMarks[mark.id]);
-    if (excluded.length > 0) {
+    const hasFillRequest = generativeFillSupported && !!draftFillMask && fillPrompt.trim().length > 0;
+    const hasHotspotRequest = readyIncludedMarks.length > 0;
+
+    if (hasHotspotRequest) {
+      const excluded = marks.filter(mark => !enabledMarks[mark.id]);
+      if (excluded.length > 0) {
         setPendingExcludedMarks(excluded);
         setIsGenerationConfirmOpen(true);
         return;
+      }
     }
+
+    if (!hasFillRequest && !hasHotspotRequest) {
+      return;
+    }
+
     executeGeneration();
-  }, [isGenerating, isDemoMode, marks, enabledMarks, executeGeneration]);
+  }, [
+    isGenerating,
+    isDemoMode,
+    draftFillMask,
+    fillPrompt,
+    readyIncludedMarks,
+    marks,
+    enabledMarks,
+    executeGeneration,
+  ]);
 
   const composeOverlayImage = useCallback(async () => {
     const assetEntries = Object.values(generatedAssets);
@@ -2047,7 +2221,6 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   }, [resetPanZoom]);
 
   const handleCanvasMouseDown = (event: MouseEvent<HTMLDivElement>) => {
-    if (!isPlacingMark) return;
     if (isSpacePressed || panSessionRef.current) return;
     if (event.button !== 0) return;
 
@@ -2056,6 +2229,19 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
     const point = getNormalizedPoint(event);
     if (!point) return;
+
+    if (isDrawingFill) {
+      event.preventDefault();
+      resetFillDrawingState();
+      setFillRegion([]);
+      setDraftFillMask(null);
+      fillDrawingActiveRef.current = true;
+      fillPathRef.current = [point];
+      setFillPath([point]);
+      return;
+    }
+
+    if (!isPlacingMark) return;
 
     event.preventDefault();
     setShowHotspotOverlay(true);
@@ -2078,8 +2264,24 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
   };
 
   const handleCanvasMouseMove = (event: MouseEvent<HTMLDivElement>) => {
-    if (!isDrawingMark || !drawStartRef.current) return;
     if (isSpacePressed || panSessionRef.current) return;
+
+    if (isDrawingFill && fillDrawingActiveRef.current) {
+      const currentPoint = getNormalizedPoint(event);
+      if (!currentPoint) return;
+      const points = fillPathRef.current;
+      const lastPoint = points[points.length - 1];
+      const distance = lastPoint ? Math.hypot(currentPoint.x - lastPoint.x, currentPoint.y - lastPoint.y) : 1;
+      if (distance < 0.003) {
+        return;
+      }
+      points.push(currentPoint);
+      fillPathRef.current = points;
+      setFillPath([...points]);
+      return;
+    }
+
+    if (!isDrawingMark || !drawStartRef.current) return;
     const current = getNormalizedPoint(event);
     if (!current) return;
     const start = drawStartRef.current;
@@ -2099,7 +2301,29 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     }) : prev);
   };
 
-  const handleCanvasMouseUp = () => {
+  const handleCanvasMouseUp = async () => {
+    if (isDrawingFill && fillDrawingActiveRef.current) {
+      fillDrawingActiveRef.current = false;
+      const points = [...fillPathRef.current];
+      resetFillDrawingState();
+      if (points.length < 3) {
+        return;
+      }
+
+      try {
+        const maskBlob = await buildFillMaskFromPath(points);
+        setDraftFillMask(maskBlob);
+        setFillRegion(points);
+        setIsDrawingFill(false);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to create the fill mask.';
+        const errorMsg: ChatMessage = { id: `fill-error-${Date.now()}`, role: 'assistant', type: 'error', text: message };
+        setChatMessages(prev => [...prev, errorMsg]);
+        clearFillSelection();
+      }
+      return;
+    }
+
     if (!isDrawingMark || !drawStartRef.current || !draftMark) {
         cancelDraftMark();
         return;
@@ -2164,7 +2388,9 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setChatMessages,
   ]);
   const renderFloatingActions = () => {
-    const disabled = isGenerating || isDemoMode || includedMarks.length === 0;
+    const hasFillRequest = generativeFillSupported && !!draftFillMask && fillPrompt.trim().length > 0;
+    const hasHotspotRequest = readyIncludedMarks.length > 0;
+    const disabled = isGenerating || isDemoMode || (!hasFillRequest && !hasHotspotRequest);
     const assetsAvailable = overlaysPresent;
     const renderDisabled = isRenderingComposite || !assetsAvailable;
     const handleChatClick = () => {
@@ -2915,12 +3141,73 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
             >
               Add image hotspot
             </button>
-            {isPlacingMark && (
-              <button onClick={() => setIsPlacingMark(null)} className="text-sm font-medium text-gray-500 hover:text-gray-700">
+            <button
+              onClick={() => {
+                if (generativeFillButtonDisabled) {
+                  return;
+                }
+                if (isDrawingFill) {
+                  setIsDrawingFill(false);
+                  resetFillDrawingState();
+                  return;
+                }
+                setIsPlacingMark(null);
+                setIsDrawingFill(true);
+                resetFillDrawingState();
+                setFillRegion([]);
+                setDraftFillMask(null);
+              }}
+              disabled={generativeFillButtonDisabled}
+              className={`w-full rounded-lg border px-3 py-2 text-sm font-semibold transition-colors ${generativeFillButtonClasses}`}
+            >
+              {isDrawingFill ? 'Exit generative fill' : 'Generative fill'}
+            </button>
+            {!generativeFillSupported && (
+              <p className="text-xs text-rose-500">
+                Generative fill requires Vertex AI credentials. Add VERTEX_PROJECT_ID, VERTEX_LOCATION, and VERTEX_SERVICE_ACCOUNT_KEY to your environment and set VITE_ENABLE_VERTEX_GENERATIVE_FILL=true.
+              </p>
+            )}
+            {(isPlacingMark || isDrawingFill) && (
+              <button
+                onClick={() => {
+                  setIsPlacingMark(null);
+                  setIsDrawingFill(false);
+                  resetFillDrawingState();
+                }}
+                className="text-sm font-medium text-gray-500 hover:text-gray-700"
+              >
                 Cancel placement
               </button>
             )}
           </div>
+          {generativeFillSupported && draftFillMask && (
+            <div className="mt-4 space-y-3">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-wide text-gray-600">Generative fill prompt</p>
+                <p className="mt-1 text-xs text-gray-500">Describe what should appear inside your selection.</p>
+              </div>
+              <textarea
+                value={fillPrompt}
+                onChange={event => setFillPrompt(event.target.value)}
+                rows={3}
+                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-gray-800 shadow-sm focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-400"
+                placeholder="e.g., Extend the background with soft studio lighting"
+              />
+              <div className="flex flex-col gap-2 text-xs text-gray-500 sm:flex-row sm:items-center sm:justify-between">
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearFillSelection();
+                    setIsDrawingFill(true);
+                  }}
+                  className="text-xs font-semibold text-emerald-600 hover:text-emerald-700"
+                >
+                  Reset selection
+                </button>
+                <span>Press “Generate creative” to apply the fill.</span>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -3062,8 +3349,12 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                         if (isDrawingMark) {
                           cancelDraftMark();
                         }
+                        if (isDrawingFill && fillDrawingActiveRef.current) {
+                          fillDrawingActiveRef.current = false;
+                          resetFillDrawingState();
+                        }
                       }}
-                      className={`pointer-events-auto group relative overflow-hidden rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6 ${isPlacingMark ? 'cursor-crosshair' : ''}`}
+                      className={`pointer-events-auto group relative overflow-hidden rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6 ${isPlacingMark || isDrawingFill ? 'cursor-crosshair' : ''}`}
                     >
                       <img
                         ref={imageElementRef}
@@ -3092,7 +3383,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                       )}
                       {imageBounds.width > 0 && imageBounds.height > 0 && (
                         <div
-                          className={`absolute ${showHotspotOverlay || isPlacingMark ? '' : 'pointer-events-none'}`}
+                          className={`absolute ${showHotspotOverlay || isPlacingMark || isDrawingFill || fillRegion.length > 0 || fillPath.length > 0 ? '' : 'pointer-events-none'}`}
                           style={{
                             left: imageBounds.left,
                             top: imageBounds.top,
@@ -3100,6 +3391,24 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                             height: imageBounds.height,
                           }}
                         >
+                          {(fillPath.length > 2 || fillRegion.length > 2) && (() => {
+                            const polygonPoints = fillPath.length > 2 ? fillPath : fillRegion;
+                            const clipPathValue = `polygon(${toClipPathPolygon(polygonPoints)})`;
+                            return (
+                              <div className="absolute inset-0 pointer-events-none" key="fill-preview">
+                                <div
+                                  className="absolute inset-0 rounded"
+                                  style={{
+                                    clipPath: clipPathValue,
+                                    WebkitClipPath: clipPathValue,
+                                    backgroundColor: isDrawingFill ? 'rgba(4, 120, 87, 0.18)' : 'rgba(4, 120, 87, 0.22)',
+                                    border: '1px solid rgba(16, 185, 129, 0.65)',
+                                    boxShadow: '0 0 0 1px rgba(15, 118, 110, 0.35)'
+                                  }}
+                                />
+                              </div>
+                            );
+                          })()}
                           {(showHotspotOverlay || isPlacingMark) && marks.map(mark => {
                             const left = ((mark.x - (mark.width ?? 0) / 2)) * 100;
                             const top = ((mark.y - (mark.height ?? 0) / 2)) * 100;
@@ -3184,6 +3493,11 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                               }}
                             />
                           )}
+                        </div>
+                      )}
+                      {isDrawingFill && (
+                        <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/50 p-4 text-center text-white">
+                          Paint over the area you want to regenerate, then release to describe the new content.
                         </div>
                       )}
                       {isPlacingMark && (

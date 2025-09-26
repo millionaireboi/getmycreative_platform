@@ -1,6 +1,7 @@
 import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 import genieHandler from './api/genie.ts';
+import generativeFillHandler from './api/generative-fill.ts';
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
@@ -14,47 +15,52 @@ export default defineConfig(({ mode }) => {
     plugins: [
       react(),
       {
-        name: 'genie-dev-middleware',
+        name: 'api-dev-middleware',
         configureServer(server) {
-          server.middlewares.use('/api/genie', async (req, res) => {
-            if (!req.method || req.method.toUpperCase() !== 'POST') {
-              res.statusCode = 405;
-              res.setHeader('Allow', 'POST');
-              res.end('Method Not Allowed');
-              return;
-            }
+          const attachHandler = (path: string, handler: (request: Request) => Promise<Response>) => {
+            server.middlewares.use(path, async (req, res) => {
+              if (!req.method || req.method.toUpperCase() !== 'POST') {
+                res.statusCode = 405;
+                res.setHeader('Allow', 'POST');
+                res.end('Method Not Allowed');
+                return;
+              }
 
-            let body = '';
-            req.on('data', chunk => {
-              body += chunk;
-            });
+              let body = '';
+              req.on('data', chunk => {
+                body += chunk;
+              });
 
-            req.on('end', async () => {
-              try {
-                const request = new Request(`http://localhost${req.url ?? '/api/genie'}`, {
-                  method: 'POST',
-                  headers: req.headers as Record<string, string>,
-                  body,
-                });
+              req.on('end', async () => {
+                try {
+                  const request = new Request(`http://localhost${req.url ?? path}`, {
+                    method: 'POST',
+                    headers: req.headers as Record<string, string>,
+                    body,
+                  });
 
-                const response = await genieHandler(request);
-                res.statusCode = response.status;
-                response.headers.forEach((value, key) => res.setHeader(key, value));
-                const responseBody = await response.text();
-                res.end(responseBody);
-              } catch (error) {
-                console.error('Genie middleware error:', error);
+                  const response = await handler(request);
+                  res.statusCode = response.status;
+                  response.headers.forEach((value, key) => res.setHeader(key, value));
+                  const responseBody = await response.text();
+                  res.end(responseBody);
+                } catch (error) {
+                  console.error(`${path} middleware error:`, error);
+                  res.statusCode = 500;
+                  res.end('Internal Server Error');
+                }
+              });
+
+              req.on('error', error => {
+                console.error(`${path} middleware stream error:`, error);
                 res.statusCode = 500;
                 res.end('Internal Server Error');
-              }
+              });
             });
+          };
 
-            req.on('error', error => {
-              console.error('Genie middleware stream error:', error);
-              res.statusCode = 500;
-              res.end('Internal Server Error');
-            });
-          });
+          attachHandler('/api/genie', genieHandler);
+          attachHandler('/api/generative-fill', generativeFillHandler);
         },
       },
     ],
