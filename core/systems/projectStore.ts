@@ -128,8 +128,8 @@ export const updateProjectHistory = async (projectId: string, history: Generated
             history,
             updatedAt: Timestamp.now()
         });
-        // For simplicity, we don't re-fetch the document here, but in a real app you might.
-        return {} as Project; // Placeholder
+        const updatedSnapshot = await getDoc(projectRef);
+        return updatedSnapshot.exists() ? docToProject(updatedSnapshot) : null;
     } catch (error) {
         console.error("Error updating project history:", error);
         return null;
@@ -146,7 +146,8 @@ export const updateProjectName = async (projectId: string, name: string): Promis
             name,
             updatedAt: Timestamp.now()
         });
-        return {} as Project; // Placeholder
+        const updatedSnapshot = await getDoc(projectRef);
+        return updatedSnapshot.exists() ? docToProject(updatedSnapshot) : null;
     } catch (error) {
         console.error("Error updating project name:", error);
         return null;

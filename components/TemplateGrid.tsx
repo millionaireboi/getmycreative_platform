@@ -85,10 +85,19 @@ export const TemplateGrid = ({ onSelectTemplate, isDemoMode }: TemplateGridProps
       .filter(t => t.title.toLowerCase().includes(searchTerm.toLowerCase()))
       .filter(t => (activeTag ? t.tags.includes(activeTag) : true))
       .sort((a, b) => {
-          if (!isProWithBrandKit) return 0; // No re-ranking for non-pro users
-          const scoreA = calculateBrandMatchScore(a.palette, appUser.brandColors);
-          const scoreB = calculateBrandMatchScore(b.palette, appUser.brandColors);
-          return scoreB - a.createdAt.getTime(); // Sort descending by score
+          if (!isProWithBrandKit) {
+              return 0; // Preserve original ordering for non-pro users
+          }
+
+          const brandColors = appUser?.brandColors ?? [];
+          const scoreA = calculateBrandMatchScore(a.palette, brandColors);
+          const scoreB = calculateBrandMatchScore(b.palette, brandColors);
+
+          if (scoreA !== scoreB) {
+              return scoreB - scoreA; // Higher brand-match score first
+          }
+
+          return b.createdAt.getTime() - a.createdAt.getTime(); // Newer templates first on tie
       });
   }, [templates, searchTerm, activeTag, appUser]);
 
