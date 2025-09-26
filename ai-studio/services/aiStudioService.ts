@@ -2,6 +2,7 @@ import type { GoogleGenAI } from "@google/genai";
 import { Modality, Type } from "@google/genai";
 import type { Board, CanvasElement, ImageElement, OrchestrationPlan, ImageAnalysis, TextAnalysis, ProductAnalysis } from '../types';
 import { getGeminiClient } from '../../services/geminiService.ts';
+import { buildWhiteboardContextSummary } from './contextBuilder.ts';
 
 const API_KEY = (import.meta as any).env?.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
 
@@ -479,34 +480,7 @@ export const orchestrateRemix = async (
     const allContentElements = sourceBoards.flatMap(b => b.elements);
 
     // 1. Asset Analysis Summary for the Creative Director
-    const availableBoardsDescription = sourceBoards.map(board => {
-        const elementSummaries = board.elements.map(el => {
-            let analysisSummary = 'No analysis available.';
-            // Fix: Check if 'analysis' property exists on the element, as it's not present on all CanvasElement types (e.g., GroupElement).
-            if ('analysis' in el && el.analysis) {
-                if (el.type === 'image') {
-                    const analysis = el.analysis as ImageAnalysis | ProductAnalysis;
-                     if ('productName' in analysis && analysis.productName) {
-                        analysisSummary = `Analyzed as: Product: ${analysis.productName} (${analysis.productType}), Features: ${analysis.keyFeatures?.join(', ')}.`;
-                    } else if ('style' in analysis) {
-                        const a = analysis as ImageAnalysis;
-                        analysisSummary = `Analyzed as: Style: ${a.style}, Mood: ${a.mood}, Colors: ${a.colorPalette?.join(', ')}, Typography: ${a.typography}.`;
-                    }
-                } else if (el.type === 'text') {
-                    const a = el.analysis;
-                    analysisSummary = `Analyzed as: Style: ${a.style}, Sentiment: ${a.sentiment}, Keywords: ${a.keywords?.join(', ')}.`;
-                }
-            }
-            // Fix: Check if 'label' property exists on the element, as it's not present on all CanvasElement types (e.g., GroupElement).
-            return `    - Element @${'label' in el && el.label ? el.label : el.id.substring(0, 4)}: ${analysisSummary}`;
-        }).join('\n');
-        
-        return `- Board (Type: '${board.type}', Title: '${board.title}') contains:\n${elementSummaries}`;
-    }).join('\n');
-
-    const brandInfoDescription: string[] = [];
-    if (brandInfo?.logo?.label) brandInfoDescription.push(`- A Brand Board with a logo (@${brandInfo.logo.label})`);
-    if (brandInfo?.colors) brandInfoDescription.push(`- Brand Colors are available: ${brandInfo.colors.join(', ')}`);
+    const { availableBoardsDescription, brandInfoDescription } = buildWhiteboardContextSummary(sourceBoards, brandInfo);
     
     const imageElements = allContentElements.filter(el => el.type === 'image') as ImageElement[];
 
@@ -522,7 +496,7 @@ export const orchestrateRemix = async (
       **Available Boards & Pre-Analyzed Assets:**
       You have been provided with images and text from several boards. Each element has been pre-analyzed by another AI to extract key creative attributes. YOU MUST USE THIS ANALYSIS to inform your creative direction.
       ${availableBoardsDescription || 'No content boards provided.'}
-      ${brandInfoDescription.join('\n') || ''}
+      ${brandInfoDescription || ''}
 
       **CRITICAL INSTRUCTIONS:**
       1.  **Identify Roles using ANALYSIS:** Do not rely on board titles alone. Use the detailed analysis to determine which board provides the visual **STYLE/AESTHETIC** (e.g., analysis shows 'minimalist', 'moody') and which provides the core **PRODUCT/ASSET** (e.g., analysis shows 'product shot', 'villa').

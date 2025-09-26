@@ -35,6 +35,14 @@ const TextElementComponent: React.FC<TextElementProps> = ({ element, isSelected,
       draggable
       onClick={onSelect}
       onTap={onSelect}
+      onMouseEnter={(e) => {
+        const stage = e.target.getStage();
+        if (stage) stage.container().style.cursor = 'pointer';
+      }}
+      onMouseLeave={(e) => {
+        const stage = e.target.getStage();
+        if (stage) stage.container().style.cursor = 'default';
+      }}
       onDragEnd={(e) => {
         onChange({ x: e.target.x(), y: e.target.y() });
       }}
@@ -52,6 +60,11 @@ const TextElementComponent: React.FC<TextElementProps> = ({ element, isSelected,
           });
         }
       }}
+      stroke={isSelected ? '#10B981' : undefined}
+      strokeWidth={isSelected ? 0.6 : 0}
+      shadowColor={isSelected ? 'rgba(16, 185, 129, 0.35)' : undefined}
+      shadowBlur={isSelected ? 12 : 0}
+      shadowOpacity={isSelected ? 0.8 : 0}
     />
   );
 };

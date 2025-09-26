@@ -70,6 +70,7 @@ export interface Connector {
   id: string;
   fromBoard: string;
   toBoard: string;
+  elementIds?: string[];
 }
 
 export type BoardType = 'image' | 'text' | 'remix' | 'brand' | 'product';
@@ -84,6 +85,7 @@ export interface Board {
   elements: CanvasElement[];
   title: string;
   colors?: string[];
+  remixPrompt?: string;
 }
 
 export interface OrchestrationTask {

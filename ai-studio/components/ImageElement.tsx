@@ -34,6 +34,14 @@ const ImageElementComponent: React.FC<ImageElementProps> = ({ element, isSelecte
       draggable
       onClick={onSelect}
       onTap={onSelect}
+      onMouseEnter={(e) => {
+        const stage = e.target.getStage();
+        if (stage) stage.container().style.cursor = 'pointer';
+      }}
+      onMouseLeave={(e) => {
+        const stage = e.target.getStage();
+        if (stage) stage.container().style.cursor = 'default';
+      }}
       onDragEnd={(e) => {
         onChange({ x: e.target.x(), y: e.target.y() });
       }}
@@ -54,6 +62,12 @@ const ImageElementComponent: React.FC<ImageElementProps> = ({ element, isSelecte
         }
       }}
       perfectDrawEnabled={false}
+      stroke={isSelected ? '#10B981' : undefined}
+      strokeWidth={isSelected ? 2 : 0}
+      shadowColor={isSelected ? 'rgba(16, 185, 129, 0.45)' : undefined}
+      shadowBlur={isSelected ? 14 : 0}
+      shadowOpacity={isSelected ? 0.8 : 0}
+      shadowOffset={{ x: 0, y: isSelected ? 4 : 0 }}
     />
   );
 };

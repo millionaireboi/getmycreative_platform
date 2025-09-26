@@ -24,9 +24,11 @@ interface CanvasProps {
   onDeleteBoard: (boardId: string) => void;
   onGenerateRemix: (boardId: string) => void;
   busyBoardIds: Set<string> | string[];
+  onElementSelect: (boardId: string, elementId: string, additive: boolean) => void;
+  onCancelConnection: () => void;
 }
 
-const Canvas: React.FC<CanvasProps> = ({ boards, setBoards, connectors, selectedBoardIds, setSelectedBoardIds, onBoardClick, selectedElementIds, setSelectedElementIds, isConnecting, connectionStartBoardId, onStartConnection, onUploadClick, onUploadTextClick, onDeleteBoard, onGenerateRemix, busyBoardIds }) => {
+const Canvas: React.FC<CanvasProps> = ({ boards, setBoards, connectors, selectedBoardIds, setSelectedBoardIds, onBoardClick, selectedElementIds, setSelectedElementIds, isConnecting, connectionStartBoardId, onStartConnection, onUploadClick, onUploadTextClick, onDeleteBoard, onGenerateRemix, busyBoardIds, onElementSelect, onCancelConnection }) => {
   const stageRef = useRef<Konva.Stage>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [stageSize, setStageSize] = useState({ width: 1280, height: 720 });
@@ -57,6 +59,9 @@ const Canvas: React.FC<CanvasProps> = ({ boards, setBoards, connectors, selected
       setSelectedBoardIds([]);
       // Fix: 'setSelectedElementIds' was not defined because it was missing from the props destructuring.
       setSelectedElementIds([]);
+      if (isConnecting) {
+        onCancelConnection();
+      }
     }
   };
   
@@ -167,6 +172,8 @@ const Canvas: React.FC<CanvasProps> = ({ boards, setBoards, connectors, selected
                 onDelete={() => onDeleteBoard(board.id)}
                 onGenerateRemix={() => onGenerateRemix(board.id)}
                 isBusy={Array.isArray(busyBoardIds) ? busyBoardIds.includes(board.id) : busyBoardIds.has(board.id)}
+                selectedElementIds={selectedElementIds}
+                onElementSelect={onElementSelect}
               />
             ))}
         </Layer>

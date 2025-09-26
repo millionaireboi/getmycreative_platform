@@ -1,6 +1,4 @@
-
-
-import React from 'react';
+import React, { useCallback, useState } from 'react';
 import { Group, Rect, Text, Path } from 'react-konva';
 import 'konva/lib/shapes/Path'; // Import to register Path shape with Konva
 import type Konva from 'konva';
@@ -9,6 +7,7 @@ import type { Board, CanvasElement, ImageElement, TextElement, VideoElement } fr
 import ImageElementComponent from './ImageElement.tsx';
 import TextElementComponent from './TextElement.tsx';
 import VideoElementComponent from './VideoElementComponent.tsx';
+import { HEADER_BASE_HEIGHT, LABEL_LINE_HEIGHT, LABEL_MARGIN, REMIX_HEADER_HEIGHT, REMIX_PROMPT_MAX_CHARS, getElementBounds } from '../utils/layout.ts';
 
 interface BoardComponentProps {
   board: Board;
@@ -23,6 +22,8 @@ interface BoardComponentProps {
   onDelete: () => void;
   onGenerateRemix: () => void;
   isBusy?: boolean;
+  selectedElementIds: string[];
+  onElementSelect: (boardId: string, elementId: string, additive: boolean) => void;
 }
 
 const KonvaConnectIcon: React.FC<{isActive: boolean}> = ({ isActive }) => {
@@ -69,7 +70,44 @@ const KonvaGenerateIcon: React.FC = () => {
 };
 
 
-const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, onChange, isSelected, isConnecting, isConnectionStart, onStartConnection, onUploadClick, onUploadTextClick, onDelete, onGenerateRemix, isBusy }) => {
+const BoardComponent: React.FC<BoardComponentProps> = ({
+  board,
+  onBoardClick,
+  onChange,
+  isSelected,
+  isConnecting,
+  isConnectionStart,
+  onStartConnection,
+  onUploadClick,
+  onUploadTextClick,
+  onDelete,
+  onGenerateRemix,
+  isBusy,
+  selectedElementIds,
+  onElementSelect,
+}) => {
+
+  const [copiedPrompt, setCopiedPrompt] = useState(false);
+
+  const handleCopyPrompt = useCallback(() => {
+    if (!board.remixPrompt) return;
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(board.remixPrompt).then(() => {
+        setCopiedPrompt(true);
+        setTimeout(() => setCopiedPrompt(false), 1600);
+      }).catch(() => {
+        setCopiedPrompt(false);
+      });
+    }
+  }, [board.remixPrompt]);
+
+  const handleElementSelect = useCallback((elementId: string, event: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
+    event.cancelBubble = true;
+    const isMultiSelect = event.evt.shiftKey || event.evt.metaKey || event.evt.ctrlKey;
+    onElementSelect(board.id, elementId, isMultiSelect);
+  }, [board.id, onElementSelect]);
+
+  const headerHeight = board.type === 'remix' && board.remixPrompt ? REMIX_HEADER_HEIGHT : HEADER_BASE_HEIGHT;
 
   const renderBrandBoardElements = () => {
     const logo = board.elements.find(el => el.type === 'image') as ImageElement;
@@ -79,8 +117,23 @@ const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, on
 
     return (
         <Group>
-            {logo && <ImageElementComponent element={logo} isSelected={false} onSelect={() => {}} onChange={() => {}} />}
-            {texts.map(t => <TextElementComponent key={t.id} element={t} isSelected={false} onSelect={() => {}} onChange={() => {}} />)}
+            {logo && (
+              <ImageElementComponent
+                element={logo}
+                isSelected={selectedElementIds.includes(logo.id)}
+                onSelect={(evt) => handleElementSelect(logo.id, evt)}
+                onChange={() => {}}
+              />
+            )}
+            {texts.map(t => (
+              <TextElementComponent
+                key={t.id}
+                element={t}
+                isSelected={selectedElementIds.includes(t.id)}
+                onSelect={(evt) => handleElementSelect(t.id, evt)}
+                onChange={() => {}}
+              />
+            ))}
             {colors.map((color, index) => (
                 <Group key={color + index} x={20} y={170 + index * 40}>
                     <Rect width={128} height={30} fill={color} cornerRadius={4} />
@@ -95,12 +148,14 @@ const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, on
     const isUploadableImageBoard = board.type === 'product' || board.type === 'image';
     const isUploadableTextBoard = board.type === 'text';
 
+    const contentHeight = board.height - headerHeight;
+
     if (board.type === 'remix') {
          return (
             <Text
                 text={"Your remixed variations will appear here."}
                 x={0}
-                y={board.height / 2 - 100}
+                y={contentHeight / 2 - 24}
                 width={board.width}
                 align="center"
                 fill="#9CA3AF"
@@ -134,7 +189,7 @@ const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, on
             <Text
                 text={promptText}
                 x={0}
-                y={board.height / 2 - 100}
+                y={contentHeight / 2 - 120}
                 width={board.width}
                 align="center"
                 fill="#9CA3AF"
@@ -143,7 +198,7 @@ const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, on
             />
             <Rect 
                 x={board.width / 2 - 110}
-                y={board.height / 2 - 70}
+                y={contentHeight / 2 - 70}
                 width={220}
                 height={40}
                 fill="#10B981"
@@ -152,7 +207,7 @@ const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, on
             <Text
                 text={buttonText}
                 x={board.width / 2 - 110}
-                y={board.height / 2 - 62}
+                y={contentHeight / 2 - 62}
                 width={220}
                 align="center"
                 fill="#FFF"
@@ -166,26 +221,35 @@ const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, on
 
   const renderDefaultBoardElements = () => {
     return board.elements.map(element => {
-        const isElSelected = false; 
-        const onElementSelect = () => {};
+        const isElSelected = selectedElementIds.includes(element.id);
         const onElementChange = () => {};
+        const bounds = getElementBounds(element);
+        const labelY = bounds.bottom + (('label' in element && element.label) ? LABEL_MARGIN : 0);
 
         switch (element.type) {
             case 'image':
                 return (
                     <Group key={element.id}>
-                        <ImageElementComponent element={element} isSelected={isElSelected} onSelect={onElementSelect} onChange={onElementChange} />
+                        <ImageElementComponent element={element} isSelected={isElSelected} onSelect={(evt) => handleElementSelect(element.id, evt)} onChange={onElementChange} />
                         {element.label && (
-                             <Text 
-                                text={element.label}
-                                x={element.x}
-                                y={element.y + element.height + 4}
-                                width={element.width}
-                                align="center"
-                                fill="#9CA3AF"
-                                fontFamily="Inter"
-                                fontSize={14}
+                          <Group x={element.x} y={labelY} listening={false}>
+                            <Rect
+                              width={element.width}
+                              height={LABEL_LINE_HEIGHT}
+                              cornerRadius={6}
+                              fill="rgba(148, 163, 184, 0.16)"
                             />
+                            <Text
+                              text={element.label}
+                              width={element.width}
+                              height={LABEL_LINE_HEIGHT}
+                              align="center"
+                              fill="#475569"
+                              fontFamily="Inter"
+                              fontSize={13}
+                              verticalAlign="middle"
+                            />
+                          </Group>
                         )}
                     </Group>
                 );
@@ -193,18 +257,26 @@ const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, on
                 const textEl = element as TextElement;
                 return (
                     <Group key={textEl.id}>
-                        <TextElementComponent element={textEl} isSelected={isElSelected} onSelect={onElementSelect} onChange={onElementChange} />
+                        <TextElementComponent element={textEl} isSelected={isElSelected} onSelect={(evt) => handleElementSelect(textEl.id, evt)} onChange={onElementChange} />
                         {textEl.label && (
-                             <Text 
-                                text={textEl.label}
-                                x={textEl.x}
-                                y={textEl.y + textEl.fontSize + 6}
-                                width={textEl.width}
-                                align="center"
-                                fill="#9CA3AF"
-                                fontFamily="Inter"
-                                fontSize={14}
+                          <Group x={textEl.x} y={labelY} listening={false}>
+                            <Rect
+                              width={textEl.width}
+                              height={LABEL_LINE_HEIGHT}
+                              cornerRadius={6}
+                              fill="rgba(148, 163, 184, 0.16)"
                             />
+                            <Text
+                              text={textEl.label}
+                              width={textEl.width}
+                              height={LABEL_LINE_HEIGHT}
+                              align="center"
+                              fill="#475569"
+                              fontFamily="Inter"
+                              fontSize={13}
+                              verticalAlign="middle"
+                            />
+                          </Group>
                         )}
                     </Group>
                 );
@@ -214,18 +286,26 @@ const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, on
                  const videoEl = element as VideoElement;
                  return (
                     <Group key={videoEl.id}>
-                        <VideoElementComponent element={videoEl} isSelected={isElSelected} onSelect={onElementSelect} onChange={onElementChange} />
-                         {videoEl.label && (
-                             <Text 
-                                text={videoEl.label}
-                                x={videoEl.x}
-                                y={videoEl.y + videoEl.height + 4}
-                                width={videoEl.width}
-                                align="center"
-                                fill="#9CA3AF"
-                                fontFamily="Inter"
-                                fontSize={14}
+                        <VideoElementComponent element={videoEl} isSelected={isElSelected} onSelect={(evt) => handleElementSelect(videoEl.id, evt)} onChange={onElementChange} />
+                        {videoEl.label && (
+                          <Group x={videoEl.x} y={labelY} listening={false}>
+                            <Rect
+                              width={videoEl.width}
+                              height={LABEL_LINE_HEIGHT}
+                              cornerRadius={6}
+                              fill="rgba(148, 163, 184, 0.16)"
                             />
+                            <Text
+                              text={videoEl.label}
+                              width={videoEl.width}
+                              height={LABEL_LINE_HEIGHT}
+                              align="center"
+                              fill="#475569"
+                              fontFamily="Inter"
+                              fontSize={13}
+                              verticalAlign="middle"
+                            />
+                          </Group>
                         )}
                     </Group>
                 );
@@ -290,7 +370,7 @@ const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, on
         />
         <Rect
             width={board.width}
-            height={40}
+            height={headerHeight}
             fill={headerColor}
             cornerRadius={[10, 10, 0, 0]}
         />
@@ -303,6 +383,59 @@ const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, on
             fontFamily="Inter"
             fontStyle="bold"
         />
+
+        {board.type === 'remix' && board.remixPrompt && (
+          <Group x={12} y={42}>
+            <Rect
+              width={board.width - 24}
+              height={REMIX_HEADER_HEIGHT - 52}
+              cornerRadius={8}
+              fill="rgba(255, 255, 255, 0.78)"
+            />
+            <Text
+              text={board.remixPrompt.length > REMIX_PROMPT_MAX_CHARS ? `${board.remixPrompt.slice(0, REMIX_PROMPT_MAX_CHARS - 1)}…` : board.remixPrompt}
+              x={12}
+              y={10}
+              width={board.width - 132}
+              fill="#1F2937"
+              fontFamily="Inter"
+              fontSize={13}
+              lineHeight={1.4}
+            />
+            <Group
+              x={board.width - 108}
+              y={10}
+              onClick={(e) => { e.cancelBubble = true; handleCopyPrompt(); }}
+              onTap={(e) => { e.cancelBubble = true; handleCopyPrompt(); }}
+              onMouseEnter={e => {
+                const stage = e.target.getStage();
+                if (stage) stage.container().style.cursor = 'pointer';
+              }}
+              onMouseLeave={e => {
+                const stage = e.target.getStage();
+                if (stage) stage.container().style.cursor = 'default';
+              }}
+            >
+              <Rect
+                width={84}
+                height={28}
+                cornerRadius={6}
+                fill={copiedPrompt ? 'rgba(16, 185, 129, 0.9)' : 'rgba(99, 102, 241, 0.85)'}
+              />
+              <Text
+                text={copiedPrompt ? 'Copied' : 'Copy'}
+                width={84}
+                height={28}
+                align="center"
+                verticalAlign="middle"
+                fill="#FFFFFF"
+                fontFamily="Inter"
+                fontStyle="bold"
+                fontSize={12}
+              />
+            </Group>
+          </Group>
+        )}
 
         {isSelected && (
            <Group>
@@ -379,24 +512,24 @@ const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, on
         )}
       
       {/* Group to clip the content area */}
-      <Group clip={{ x: 0, y: 40, width: board.width, height: board.height - 40 }}>
-         <Group x={0} y={40}>
+      <Group clip={{ x: 0, y: headerHeight, width: board.width, height: board.height - headerHeight }}>
+         <Group x={0} y={headerHeight}>
            {
                board.elements.length === 0 ? renderEmptyState() : renderBoardContent()
            }
          </Group>
          {isBusy && (
-            <Group x={0} y={40}>
+            <Group x={0} y={headerHeight}>
               <Rect
                 width={board.width}
-                height={board.height - 40}
+                height={board.height - headerHeight}
                 fill="rgba(15,23,42,0.35)"
                 cornerRadius={[0, 0, 10, 10]}
               />
               <Text
                 text="🪄 Magic in progress..."
                 x={board.width / 2 - 120}
-                y={(board.height - 40) / 2 - 12}
+                y={(board.height - headerHeight) / 2 - 12}
                 width={240}
                 align="center"
                 fontSize={18}
@@ -406,7 +539,7 @@ const BoardComponent: React.FC<BoardComponentProps> = ({ board, onBoardClick, on
               <Text
                 text="Our genie is working on your board."
                 x={board.width / 2 - 140}
-                y={(board.height - 40) / 2 + 16}
+                y={(board.height - headerHeight) / 2 + 16}
                 width={280}
                 align="center"
                 fontSize={14}

@@ -14,17 +14,28 @@ import BrandBoardModal from './components/BrandBoardModal.tsx';
 import BrandIdentityChoiceModal from './components/BrandIdentityChoiceModal.tsx';
 import UploadBrandAssetsModal from './components/UploadBrandAssetsModal.tsx';
 import PromptModal from './components/PromptModal.tsx';
+import GeniePanel, { GenieConversationMessage } from './components/GeniePanel.tsx';
 import type { BrandAssetData } from './components/UploadBrandAssetsModal.tsx';
 import { generateImage, orchestrateRemix, generateVideo, generateTextVariations, generateBrandIdentity, analyzeImageContent, analyzeTextContent, analyzeProductImageContent, removeImageBackground } from './services/aiStudioService.ts';
+import { sendGenieMessage } from './services/genieService.ts';
 import { isApiConfigured } from '../services/geminiService.ts';
 import type { CanvasElement, ImageElement, TextElement, Board, BoardType, Connector } from './types.ts';
 import { LogoIcon, LoadingSpinner } from './components/icons.tsx';
 import { ArrowLeftIcon } from '../components/icons.tsx';
 import { findElement, findElementAndParent } from './utils/elementUtils.ts';
 import { MOTION_TOKEN, prefersReducedMotion } from './utils/motion.ts';
+import { withResponsiveBoardSize, BOARD_PADDING } from './utils/layout.ts';
+import { loadWhiteboardState, saveWhiteboardState } from './storage/whiteboardStore.ts';
+import { useAuth } from '../contexts/AuthContext.tsx';
 
 interface AIStudioViewProps {
   onBack?: () => void;
+}
+
+interface RemixContext {
+  contentBoards: Board[];
+  brandBoard?: Board;
+  brandInfo?: { colors?: string[]; logo?: ImageElement };
 }
 
 const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
@@ -52,6 +63,12 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
 
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectionStartBoardId, setConnectionStartBoardId] = useState<string | null>(null);
+  const [connectionStartElementIds, setConnectionStartElementIds] = useState<string[]>([]);
+  const [isGenieOpen, setIsGenieOpen] = useState(false);
+  const [genieMessages, setGenieMessages] = useState<GenieConversationMessage[]>([]);
+  const [isGenieLoading, setIsGenieLoading] = useState(false);
+  const { appUser } = useAuth();
+  const [hasRestoredWorkspace, setHasRestoredWorkspace] = useState(false);
 
   const isGeminiReady = isApiConfigured();
   const aiDisabled = !isGeminiReady;
@@ -64,6 +81,53 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
   const previousBoardCountRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textFileInputRef = useRef<HTMLInputElement>(null);
+  const genieActiveBoardRef = useRef<string | null>(null);
+
+  const computeRemixContext = useCallback((remixBoardId: string): RemixContext | null => {
+    const remixBoard = boards.find(b => b.id === remixBoardId);
+    if (!remixBoard || remixBoard.type !== 'remix') {
+      return null;
+    }
+
+    const relevantConnectors = connectors.filter(connector => connector.toBoard === remixBoardId);
+    const sourceBoardMeta = new Map<string, { useAll: boolean; elementIds: Set<string> }>();
+
+    relevantConnectors.forEach(connector => {
+      if (!connector.fromBoard) return;
+      const meta = sourceBoardMeta.get(connector.fromBoard) || { useAll: false, elementIds: new Set<string>() };
+      if (!connector.elementIds || connector.elementIds.length === 0) {
+        meta.useAll = true;
+        meta.elementIds.clear();
+      } else if (!meta.useAll) {
+        connector.elementIds.forEach(id => meta.elementIds.add(id));
+      }
+      sourceBoardMeta.set(connector.fromBoard, meta);
+    });
+
+    const filteredBoards: Board[] = [];
+    sourceBoardMeta.forEach((meta, boardId) => {
+      const sourceBoard = boards.find(b => b.id === boardId);
+      if (!sourceBoard) return;
+      const filteredElements = meta.useAll
+        ? sourceBoard.elements
+        : sourceBoard.elements.filter(element => meta.elementIds.has(element.id));
+      const effectiveElements = (!meta.useAll && filteredElements.length === 0)
+        ? sourceBoard.elements
+        : filteredElements;
+      if (effectiveElements.length === 0) return;
+      filteredBoards.push({ ...sourceBoard, elements: effectiveElements });
+    });
+
+    const brandBoard =
+      filteredBoards.find(board => board.type === 'brand') ??
+      boards.find(board => board.type === 'brand' && sourceBoardMeta.has(board.id));
+
+    const brandLogo = brandBoard?.elements.find(element => element.type === 'image') as ImageElement | undefined;
+    const contentBoards = filteredBoards.filter(board => board.type !== 'brand');
+    const brandInfo = brandBoard ? { colors: brandBoard.colors, logo: brandLogo } : undefined;
+
+    return { contentBoards, brandBoard, brandInfo };
+  }, [boards, connectors]);
 
   const markBoardBusy = useCallback((boardId: string) => {
     setBusyBoardIds(prev => {
@@ -130,6 +194,37 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
   }, []);
 
   useEffect(() => {
+    let isCancelled = false;
+    const restoreState = async () => {
+      setHasRestoredWorkspace(false);
+      try {
+        const stored = await loadWhiteboardState(appUser?.id);
+        if (isCancelled) return;
+        if (stored) {
+          const sizedBoards = stored.boards.map(b => withResponsiveBoardSize(b));
+          setBoards(sizedBoards);
+          setConnectors(stored.connectors);
+        } else {
+          setBoards([]);
+          setConnectors([]);
+        }
+      } finally {
+        if (!isCancelled) {
+          setSelectedBoardIds([]);
+          setSelectedElementIds([]);
+          setHasRestoredWorkspace(true);
+        }
+      }
+    };
+
+    restoreState();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [appUser?.id]);
+
+  useEffect(() => {
     if (prefersReducedMotion()) return;
     if (!canvasShellRef.current) return;
 
@@ -150,6 +245,16 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
     previousBoardCountRef.current = boards.length;
   }, [boards.length]);
 
+  useEffect(() => {
+    if (!hasRestoredWorkspace) return;
+
+    const persistState = async () => {
+      await saveWhiteboardState(appUser?.id, { boards, connectors });
+    };
+
+    void persistState();
+  }, [boards, connectors, appUser?.id, hasRestoredWorkspace]);
+
   const handleSubmitPrompt = (currentPrompt: string) => {
     const selectedBoardId = selectedBoardIds[0];
     const selectedBoard = boards.find(b => b.id === selectedBoardId);
@@ -161,38 +266,79 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
     }
   };
 
+  const handleSendGenie = useCallback(async (message: string): Promise<boolean> => {
+    const activeBoard = boards.find(b => b.id === selectedBoardIds[0]);
+    if (!activeBoard || activeBoard.type !== 'remix') {
+      setError('Select a Remix board to chat with Genie.');
+      return false;
+    }
+
+    const context = computeRemixContext(activeBoard.id);
+    if (!context || context.contentBoards.length === 0) {
+      setError('Connect at least one content board to your Remix board so Genie has context.');
+      return false;
+    }
+
+    const goal = prompt.trim() || activeBoard.remixPrompt || 'Creative brief not yet specified.';
+    const historyPayload = genieMessages.map(({ role, text }) => ({ role, text }));
+    const userMessage: GenieConversationMessage = { id: uuidv4(), role: 'user', text: message };
+
+    setGenieMessages(prev => [...prev, userMessage]);
+    setIsGenieLoading(true);
+
+    try {
+      const reply = await sendGenieMessage({
+        goal,
+        boards: context.contentBoards,
+        brandInfo: context.brandInfo,
+        message,
+        history: historyPayload,
+      });
+
+      const genieReply: GenieConversationMessage = { id: uuidv4(), role: 'genie', text: reply };
+      setGenieMessages(prev => [...prev, genieReply]);
+      return true;
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Genie failed to respond.';
+      setError(errorMessage);
+      const fallbackReply: GenieConversationMessage = {
+        id: uuidv4(),
+        role: 'genie',
+        text: `I ran into an issue processing that request: ${errorMessage}`,
+      };
+      setGenieMessages(prev => [...prev, fallbackReply]);
+      return false;
+    } finally {
+      setIsGenieLoading(false);
+    }
+  }, [boards, selectedBoardIds, computeRemixContext, prompt, genieMessages]);
+
   const handleRemix = async (remixBoardId: string) => {
      if (!prompt.trim()) {
         setError("Please enter a prompt to generate a remix.");
         return;
      }
+
+     const remixContext = computeRemixContext(remixBoardId);
+     if (!remixContext || remixContext.contentBoards.length === 0) {
+        setError("Connect at least one board with assets to your Remix board before generating a remix.");
+        return;
+     }
+
      markBoardBusy(remixBoardId);
      setIsLoading(true);
      setError(null);
      setLoadingMessage('Remixing in progress...');
      try {
-        const sourceBoardIds = connectors
-            .filter(c => c.toBoard === remixBoardId)
-            .map(c => c.fromBoard);
-        
-        const allSourceBoards = boards.filter(b => sourceBoardIds.includes(b.id));
-        
-        const brandBoard = allSourceBoards.find(b => b.type === 'brand');
-        const contentBoards = allSourceBoards.filter(b => b.type !== 'brand');
-        const brandLogo = brandBoard?.elements.find(e => e.type === 'image') as ImageElement | undefined;
-
         const newImageSrcs = await orchestrateRemix(
-            prompt, 
-            contentBoards, 
-            { 
-                colors: brandBoard?.colors,
-                logo: brandLogo
-            },
+            prompt,
+            remixContext.contentBoards,
+            remixContext.brandInfo,
             setLoadingMessage // Pass the progress callback
         );
 
         const itemSize = 256;
-        const padding = 12;
+        const padding = BOARD_PADDING;
 
         const newImages: ImageElement[] = newImageSrcs.map((src, index) => ({
             id: uuidv4(),
@@ -209,8 +355,9 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
 
         setBoards(prevBoards => prevBoards.map(b => {
             if (b.id === remixBoardId) {
-                // Replace existing elements with the new ones
-                return { ...b, elements: newImages };
+                // Replace existing elements with the new ones and track the prompt used
+                const nextBoard: Board = { ...b, elements: newImages, remixPrompt: prompt };
+                return withResponsiveBoardSize(nextBoard);
             }
             return b;
         }));
@@ -237,7 +384,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
         let newElements: CanvasElement[] = [];
         const boardWidth = 550;
         const itemSize = 256;
-        const padding = 12;
+        const padding = BOARD_PADDING;
 
         const labelPrefix = boardName.replace(/[^a-zA-Z0-9]/g, '');
 
@@ -278,7 +425,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
             } as TextElement));
         }
 
-        const newBoard: Board = {
+        const newBoardBase: Board = {
             id: uuidv4(),
             type,
             title: boardName,
@@ -288,6 +435,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
             height: 600,
             elements: newElements,
         };
+        const newBoard = withResponsiveBoardSize(newBoardBase);
 
         setBoards(prev => [...prev, newBoard]);
 
@@ -302,7 +450,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
 
   const handleCreateEmptyBoard = (type: BoardType, boardName: string) => {
     const boardWidth = 550;
-    const newBoard: Board = {
+    const newBoardBase: Board = {
       id: uuidv4(),
       type: type,
       title: boardName,
@@ -312,6 +460,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
       height: 600,
       elements: [],
     };
+    const newBoard = withResponsiveBoardSize(newBoardBase);
     setBoards(prev => [...prev, newBoard]);
     setSelectedBoardIds([newBoard.id]);
   };
@@ -357,7 +506,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
         }));
 
         const boardWidth = 550;
-        const newBoard: Board = {
+        const newBoardBase: Board = {
             id: uuidv4(),
             type: 'brand',
             title: `${brandConcept} - Brand Kit`,
@@ -368,7 +517,8 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
             elements: [logoElement, ...textElements],
             colors: colors
         };
-        
+        const newBoard = withResponsiveBoardSize(newBoardBase);
+
         setBoards(prev => [...prev, newBoard]);
 
     } catch (err) {
@@ -405,7 +555,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
         }] : [];
 
         const boardWidth = 550;
-        const newBoard: Board = {
+        const newBoardBase: Board = {
             id: uuidv4(),
             type: 'brand',
             title: `${data.brandName} - Brand Kit`,
@@ -420,6 +570,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
             colors: data.colors,
         };
         
+        const newBoard = withResponsiveBoardSize(newBoardBase);
         setBoards(prev => [...prev, newBoard]);
 
     } catch (err) {
@@ -441,7 +592,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
 
   const handleCreateRemixBoard = () => {
     const boardWidth = 550;
-    const newBoard: Board = {
+    const newBoardBase: Board = {
       id: uuidv4(),
       type: 'remix',
       title: 'Remix Stage',
@@ -451,6 +602,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
       height: 600,
       elements: [],
     };
+    const newBoard = withResponsiveBoardSize(newBoardBase);
     setBoards(prev => [...prev, newBoard]);
   };
 
@@ -466,6 +618,14 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
   const handleStartConnection = (boardId: string) => {
     setIsConnecting(true);
     setConnectionStartBoardId(boardId);
+    const sourceBoard = boards.find(b => b.id === boardId);
+    if (sourceBoard) {
+      const elementSet = new Set(sourceBoard.elements.map(el => el.id));
+      const selectedForBoard = selectedElementIds.filter(id => elementSet.has(id));
+      setConnectionStartElementIds(selectedForBoard);
+    } else {
+      setConnectionStartElementIds([]);
+    }
   };
   
   const handleBoardClick = (boardId: string) => {
@@ -477,24 +637,63 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
         // This case should not happen with the new flow
       } else {
         if (clickedBoard.type === 'remix' && connectionStartBoardId !== boardId) {
-          const existingConnection = connectors.find(c => c.fromBoard === connectionStartBoardId && c.toBoard === boardId);
-          if (!existingConnection) {
-            setConnectors(prev => [...prev, {
+          const startBoard = boards.find(b => b.id === connectionStartBoardId);
+          if (startBoard) {
+            const startElementSet = new Set(startBoard.elements.map(el => el.id));
+            const resolvedElementIds = connectionStartElementIds.filter(id => startElementSet.has(id));
+            const uniqueElementIds = Array.from(new Set(resolvedElementIds));
+            const sanitizedElementIds = uniqueElementIds.length > 0 ? uniqueElementIds : undefined;
+
+            const existingConnectionIndex = connectors.findIndex(c => c.fromBoard === connectionStartBoardId && c.toBoard === boardId);
+            if (existingConnectionIndex >= 0) {
+              setConnectors(prev => prev.map((conn, index) => {
+                if (index !== existingConnectionIndex) return conn;
+                if (sanitizedElementIds) {
+                  return { ...conn, elementIds: sanitizedElementIds };
+                }
+                const { elementIds: _omit, ...rest } = conn;
+                return { ...rest } as Connector;
+              }));
+            } else {
+              setConnectors(prev => [...prev, {
                 id: uuidv4(),
                 fromBoard: connectionStartBoardId,
-                toBoard: boardId
-            }]);
+                toBoard: boardId,
+                ...(sanitizedElementIds ? { elementIds: sanitizedElementIds } : {}),
+              }]);
+            }
           }
         }
         // Always exit connection mode after a second click
-        setIsConnecting(false);
-        setConnectionStartBoardId(null);
+        cancelConnection();
       }
     } else {
       setSelectedBoardIds([boardId]);
       setSelectedElementIds([]);
     }
   };
+
+  const handleElementSelect = useCallback((boardId: string, elementId: string, additive: boolean) => {
+    const board = boards.find(b => b.id === boardId);
+    const boardElementIds = board ? new Set(board.elements.map(el => el.id)) : new Set<string>();
+    setSelectedBoardIds([boardId]);
+    setSelectedElementIds(prev => {
+      const scopedSelection = prev.filter(id => boardElementIds.has(id));
+      if (additive) {
+        if (scopedSelection.includes(elementId)) {
+          return scopedSelection.filter(id => id !== elementId);
+        }
+        return [...scopedSelection, elementId];
+      }
+      return [elementId];
+    });
+  }, [boards]);
+
+  const cancelConnection = useCallback(() => {
+    setIsConnecting(false);
+    setConnectionStartBoardId(null);
+    setConnectionStartElementIds([]);
+  }, []);
 
   const handleDeleteBoards = useCallback((boardIdsToDelete: string[]) => {
     if (boardIdsToDelete.length === 0) return;
@@ -554,7 +753,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
 
     try {
         const itemSize = 256;
-        const padding = 12;
+        const padding = BOARD_PADDING;
         const startingCount = selectedBoard.elements.length;
         const labelPrefix = selectedBoard.title.replace(/[^a-zA-Z0-9]/g, '');
 
@@ -596,7 +795,8 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
 
         setBoards(prevBoards => prevBoards.map(b => {
             if (b.id === selectedBoardId) {
-                return { ...b, elements: [...b.elements, ...newImages] };
+                const nextBoard: Board = { ...b, elements: [...b.elements, ...newImages] };
+                return withResponsiveBoardSize(nextBoard);
             }
             return b;
         }));
@@ -643,7 +843,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
         const paragraphs = content.split(/\n\s*\n/).filter(p => p.trim().length > 0);
         
         const itemSize = 256;
-        const padding = 12;
+        const padding = BOARD_PADDING;
         const startingCount = selectedBoard.elements.length;
         const labelPrefix = selectedBoard.title.replace(/[^a-zA-Z0-9]/g, '');
 
@@ -671,7 +871,8 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
         
         setBoards(prevBoards => prevBoards.map(b => {
             if (b.id === selectedBoardId) {
-                return { ...b, elements: [...b.elements, ...newElements] };
+                const nextBoard: Board = { ...b, elements: [...b.elements, ...newElements] };
+                return withResponsiveBoardSize(nextBoard);
             }
             return b;
         }));
@@ -724,7 +925,8 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
                     }
                     return el;
                 });
-                return { ...b, elements: newElements };
+                const nextBoard: Board = { ...b, elements: newElements };
+                return withResponsiveBoardSize(nextBoard);
             }
             return b;
         }));
@@ -740,8 +942,11 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
   };
   
   const selectedElements = useMemo(() => {
-    return []; // Placeholder
-  }, [boards, selectedElementIds]);
+    if (selectedBoardIds.length === 0) return [];
+    const activeBoard = boards.find(b => b.id === selectedBoardIds[0]);
+    if (!activeBoard) return [];
+    return activeBoard.elements.filter(el => selectedElementIds.includes(el.id));
+  }, [boards, selectedBoardIds, selectedElementIds]);
   
   const toolbarPlaceholder = useMemo(() => {
       const selectedBoard = boards.find(b => b.id === selectedBoardIds[0]);
@@ -757,27 +962,45 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
       return [];
     }
 
-    const sourceBoardIds = connectors
-      .filter(c => c.toBoard === selectedBoard.id)
-      .map(c => c.fromBoard);
+    const relevantConnectors = connectors.filter(c => c.toBoard === selectedBoard.id);
+    const labelSet = new Set<string>();
 
-    const sourceBoards = boards.filter(b => sourceBoardIds.includes(b.id));
-
-    const allLabels = sourceBoards
-      .flatMap(b => b.elements)
-      // Fix: Use `reduce` to safely filter elements and extract labels. This avoids TypeScript errors when
-      // dealing with union types like `CanvasElement` where not all members (e.g., `GroupElement`) have a `label` property.
-      .reduce<string[]>((acc, el) => {
+    relevantConnectors.forEach(conn => {
+      const sourceBoard = boards.find(b => b.id === conn.fromBoard);
+      if (!sourceBoard) return;
+      const elementFilter = conn.elementIds && conn.elementIds.length > 0 ? new Set(conn.elementIds) : null;
+      const filtered = elementFilter ? sourceBoard.elements.filter(el => elementFilter.has(el.id)) : sourceBoard.elements;
+      const elementsToUse = elementFilter && filtered.length === 0 ? sourceBoard.elements : filtered;
+      elementsToUse.forEach(el => {
         if ('label' in el && el.label) {
-          acc.push(el.label);
+          labelSet.add(el.label);
         }
-        return acc;
-      }, []);
-      
-    return [...new Set(allLabels)]; // Use Set to remove duplicates
-}, [boards, selectedBoardIds, connectors]);
+      });
+    });
+
+    return Array.from(labelSet);
+  }, [boards, selectedBoardIds, connectors]);
 
   const selectedBoard = useMemo(() => boards.find(b => b.id === selectedBoardIds[0]), [boards, selectedBoardIds]);
+  const selectedRemixContext = useMemo(() => {
+    if (!selectedBoard || selectedBoard.type !== 'remix') {
+      return null;
+    }
+    return computeRemixContext(selectedBoard.id);
+  }, [selectedBoard, computeRemixContext]);
+  const canUseGenie = !!selectedRemixContext && selectedRemixContext.contentBoards.length > 0;
+
+  useEffect(() => {
+    const activeRemixBoardId = selectedBoard && selectedBoard.type === 'remix' ? selectedBoard.id : null;
+    if (genieActiveBoardRef.current !== activeRemixBoardId) {
+      setGenieMessages([]);
+      genieActiveBoardRef.current = activeRemixBoardId;
+    }
+
+    if (!activeRemixBoardId) {
+      setIsGenieOpen(false);
+    }
+  }, [selectedBoard?.id, selectedBoard?.type]);
 
   return (
     <div ref={containerRef} className="relative h-screen w-screen overflow-hidden bg-[var(--ai-surface-base)] font-sans text-slate-900">
@@ -794,11 +1017,13 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
           isConnecting={isConnecting}
           connectionStartBoardId={connectionStartBoardId}
           onStartConnection={handleStartConnection}
+          onCancelConnection={cancelConnection}
           onUploadClick={handleUploadClick}
           onUploadTextClick={handleUploadTextClick}
           onDeleteBoard={(boardId) => handleDeleteBoards([boardId])}
           onGenerateRemix={handleRemix}
           busyBoardIds={busyBoardIds}
+          onElementSelect={handleElementSelect}
         />
       </div>
 
@@ -874,6 +1099,15 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
         />
       </div>
 
+      <div className="absolute bottom-[150px] right-6 z-30 flex flex-col items-end gap-2">
+        <button
+          onClick={() => setIsGenieOpen(true)}
+          className="pointer-events-auto inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-white px-4 py-2 text-sm font-semibold text-emerald-600 shadow-lg shadow-emerald-100 transition hover:bg-emerald-50"
+        >
+          Ask Genie
+        </button>
+      </div>
+
       <div ref={promptDockRef} className="absolute inset-x-0 bottom-6 z-30 flex w-full justify-center px-4 lg:px-12">
         <Toolbar 
           prompt={prompt}
@@ -884,6 +1118,20 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
           mentionSuggestions={mentionSuggestions}
         />
       </div>
+
+      <GeniePanel
+        isOpen={isGenieOpen}
+        onClose={() => setIsGenieOpen(false)}
+        messages={genieMessages}
+        isLoading={isGenieLoading}
+        onSend={handleSendGenie}
+        onUsePrompt={(finalPrompt) => {
+          setPrompt(finalPrompt);
+          setIsGenieOpen(false);
+        }}
+        contextReady={canUseGenie}
+        contextHelp="Connect at least one board of assets to your Remix board so Genie has context."
+      />
 
       {loadingMessage && (
         <div className="absolute bottom-28 left-1/2 z-30 -translate-x-1/2 rounded-full border border-emerald-100 bg-white/95 px-5 py-2 text-sm font-medium text-emerald-700 shadow-lg shadow-emerald-100/50 backdrop-blur">

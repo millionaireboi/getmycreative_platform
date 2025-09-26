@@ -16,6 +16,7 @@ export * from './entities/subscription.ts';
 export * from './entities/template.ts';
 export * from './entities/user.ts';
 export * from './entities/variant.ts';
+export * from './entities/whiteboard.ts';
 export * from './shared.ts';
 
 // Explicitly export enums that might not be picked up by '*'

@@ -1,4 +1,5 @@
-import { Project, Template, GeneratedImage } from '../types/index.ts';
+import { Project, Template, GeneratedImage, WhiteboardWorkspace, WhiteboardWorkspacePayload } from '../types/index.ts';
+import type { Board, Connector } from '../../ai-studio/types.ts';
 import { trackTemplateUsage } from './templateStore.ts';
 import { db } from '../../firebase/config.ts';
 // Use standard Firebase v9+ modular SDK imports
@@ -11,6 +12,8 @@ import {
     doc, 
     deleteDoc, 
     updateDoc,
+    setDoc,
+    getDoc,
     orderBy,
     Timestamp,
     DocumentSnapshot,
@@ -19,6 +22,7 @@ import {
 
 
 const projectsCollection = collection(db, 'projects');
+const whiteboardCollectionName = 'whiteboardWorkspaces';
 
 // Helper to convert Firestore doc to Project object
 const docToProject = (doc: DocumentSnapshot<DocumentData>): Project => {
@@ -35,6 +39,24 @@ const docToProject = (doc: DocumentSnapshot<DocumentData>): Project => {
         createdAt: createdAt,
         updatedAt: updatedAt,
     } as Project;
+};
+
+const docToWhiteboardWorkspace = (snapshot: DocumentSnapshot<DocumentData>): WhiteboardWorkspace => {
+    const data = snapshot.data();
+    if (!data) throw new Error('Document data is missing!');
+
+    const createdAt = (data.createdAt as Timestamp)?.toDate() || new Date();
+    const updatedAt = (data.updatedAt as Timestamp)?.toDate() || new Date();
+
+    return {
+        id: snapshot.id,
+        userId: data.userId as string,
+        name: typeof data.name === 'string' && data.name.trim().length > 0 ? data.name : 'AI Studio Workspace',
+        boards: Array.isArray(data.boards) ? (data.boards as Board[]) : [],
+        connectors: Array.isArray(data.connectors) ? (data.connectors as Connector[]) : [],
+        createdAt,
+        updatedAt,
+    };
 };
 
 
@@ -137,4 +159,36 @@ export const updateProjectName = async (projectId: string, name: string): Promis
 export const deleteProject = async (projectId: string): Promise<void> => {
     const projectRef = doc(db, 'projects', projectId);
     await deleteDoc(projectRef);
+};
+
+export const getUserWhiteboardWorkspace = async (userId: string): Promise<WhiteboardWorkspace | null> => {
+    const workspaceRef = doc(db, whiteboardCollectionName, userId);
+    const snapshot = await getDoc(workspaceRef);
+    if (!snapshot.exists()) {
+        return null;
+    }
+    return docToWhiteboardWorkspace(snapshot);
+};
+
+export const createUserWhiteboardWorkspace = async (userId: string, payload: WhiteboardWorkspacePayload): Promise<void> => {
+    const now = Timestamp.now();
+    const workspaceRef = doc(db, whiteboardCollectionName, userId);
+    await setDoc(workspaceRef, {
+        userId,
+        name: payload.name && payload.name.trim().length > 0 ? payload.name : 'AI Studio Workspace',
+        boards: payload.boards,
+        connectors: payload.connectors,
+        createdAt: now,
+        updatedAt: now,
+    });
+};
+
+export const updateUserWhiteboardWorkspace = async (userId: string, payload: WhiteboardWorkspacePayload): Promise<void> => {
+    const workspaceRef = doc(db, whiteboardCollectionName, userId);
+    await setDoc(workspaceRef, {
+        ...(payload.name ? { name: payload.name } : {}),
+        boards: payload.boards,
+        connectors: payload.connectors,
+        updatedAt: Timestamp.now(),
+    }, { merge: true });
 };

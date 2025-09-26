@@ -201,6 +201,18 @@ const VideoElementComponent: React.FC<VideoElementProps> = ({ element, isSelecte
       height={element.height}
       rotation={element.rotation}
       draggable={element.status === 'complete'}
+      shadowColor={isSelected ? 'rgba(16, 185, 129, 0.4)' : undefined}
+      shadowBlur={isSelected ? 18 : 0}
+      shadowOpacity={isSelected ? 0.85 : 0}
+      shadowOffset={{ x: 0, y: isSelected ? 6 : 0 }}
+      onMouseEnter={(e) => {
+        const stage = e.target.getStage();
+        if (stage) stage.container().style.cursor = 'pointer';
+      }}
+      onMouseLeave={(e) => {
+        const stage = e.target.getStage();
+        if (stage) stage.container().style.cursor = 'default';
+      }}
       // FIX: Explicitly type event objects to resolve type inference issues.
       onClick={(e: Konva.KonvaEventObject<MouseEvent>) => {
         if (element.status === 'complete' && isPlaying) {
