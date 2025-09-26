@@ -11,6 +11,7 @@ import { detectEditableRegions, getTagsForSearchQuery, isApiConfigured } from '.
 import { uploadFileToStorage } from '../firebase/config.ts';
 import { ProfileDropdown } from './Header.tsx';
 import { LayoutGridIcon, FolderIcon, PaletteIcon, UploadCloudIcon, SearchIcon, UserIcon, SettingsIcon, LogOutIcon, ChevronLeftIcon, ChevronRightIcon, SparklesIcon } from './icons.tsx';
+import { AIStudioView } from '../ai-studio/AIStudioView.tsx';
 
 interface CustomerWorkspaceProps {
     onSelectTemplate: (template: UITemplate) => void;
@@ -33,8 +34,8 @@ const useDebouncedEffect = (effect: () => void, deps: React.DependencyList, dela
 
 
 const Sidebar = ({ activeView, onNavClick, onBrandKitClick, isCollapsed, onToggle }: { 
-    activeView: string;
-    onNavClick: (view: 'explore' | 'projects') => void;
+    activeView: 'explore' | 'projects' | 'aiStudio';
+    onNavClick: (view: 'explore' | 'projects' | 'aiStudio') => void;
     onBrandKitClick: () => void;
     isCollapsed: boolean;
     onToggle: () => void;
@@ -57,6 +58,14 @@ const Sidebar = ({ activeView, onNavClick, onBrandKitClick, isCollapsed, onToggl
             >
                 <LayoutGridIcon className="w-5 h-5 flex-shrink-0" />
                 <span className={isCollapsed ? 'sr-only' : ''}>Explore</span>
+            </button>
+            <button
+                onClick={() => onNavClick('aiStudio')}
+                className={`flex items-center gap-3 px-3 py-2 rounded-lg text-base font-semibold transition-colors ${isCollapsed ? 'justify-center' : ''} ${activeView === 'aiStudio' ? 'bg-emerald-50 text-emerald-600' : 'text-gray-600 hover:bg-slate-100'}`}
+                title="AI Studio"
+            >
+                <SparklesIcon className="w-5 h-5 flex-shrink-0" />
+                <span className={isCollapsed ? 'sr-only' : ''}>AI Studio</span>
             </button>
             <button
                 onClick={() => onNavClick('projects')}
@@ -89,7 +98,7 @@ const Sidebar = ({ activeView, onNavClick, onBrandKitClick, isCollapsed, onToggl
 );
 
 export const CustomerWorkspace = ({ onSelectTemplate, onSelectProject }: CustomerWorkspaceProps) => {
-    const [activeView, setActiveView] = useState<'explore' | 'projects'>('explore');
+    const [activeView, setActiveView] = useState<'explore' | 'projects' | 'aiStudio'>('explore');
     const [searchQuery, setSearchQuery] = useState('');
     const [aiTags, setAiTags] = useState<string[]>([]);
     const [isSearching, setIsSearching] = useState(false);
@@ -175,6 +184,14 @@ export const CustomerWorkspace = ({ onSelectTemplate, onSelectProject }: Custome
         }
     };
 
+    if (activeView === 'aiStudio') {
+        return (
+            <div className="h-screen bg-slate-100">
+                <AIStudioView onBack={() => setActiveView('explore')} />
+            </div>
+        );
+    }
+
     return (
         <div className="flex h-screen bg-slate-100">
             <Sidebar 
@@ -186,50 +203,59 @@ export const CustomerWorkspace = ({ onSelectTemplate, onSelectProject }: Custome
             />
             <div className="relative flex-1">
                 <main className="flex-1 flex flex-col overflow-hidden h-full">
-                    <header className="flex-shrink-0 bg-slate-100/80 backdrop-blur-sm z-10">
-                       <div className="container mx-auto px-4 py-3 flex items-center justify-end">
-                        <div className="flex items-center gap-4">
-                            <button 
-                                onClick={handleUploadClick} 
-                                className="flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-emerald-500 rounded-lg hover:bg-emerald-600 transition-colors disabled:bg-emerald-300"
-                                disabled={isUploading}
-                            >
-                                {isUploading ? (
-                                    <SparklesIcon className="w-4 h-4 animate-spin"/>
-                                ) : (
-                                    <UploadCloudIcon className="w-4 h-4"/>
-                                )}
-                                {isUploading ? 'Processing...' : 'Upload Template'}
-                            </button>
-                            <input type="file" ref={uploadInputRef} onChange={handleFileChange} className="hidden" accept="image/*" />
-                            <ProfileDropdown/>
-                        </div>
-                       </div>
-                    </header>
-                    <div className="flex-1 overflow-y-auto">
+                    {activeView !== 'aiStudio' && (
+                        <header className="flex-shrink-0 bg-slate-100/80 backdrop-blur-sm z-10">
+                           <div className="container mx-auto px-4 py-3 flex items-center justify-end">
+                            <div className="flex items-center gap-4">
+                                <button 
+                                    onClick={handleUploadClick} 
+                                    className="flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-emerald-500 rounded-lg hover:bg-emerald-600 transition-colors disabled:bg-emerald-300"
+                                    disabled={isUploading}
+                                >
+                                    {isUploading ? (
+                                        <SparklesIcon className="w-4 h-4 animate-spin"/>
+                                    ) : (
+                                        <UploadCloudIcon className="w-4 h-4"/>
+                                    )}
+                                    {isUploading ? 'Processing...' : 'Upload Template'}
+                                </button>
+                                <input type="file" ref={uploadInputRef} onChange={handleFileChange} className="hidden" accept="image/*" />
+                                <ProfileDropdown/>
+                            </div>
+                           </div>
+                        </header>
+                    )}
+                    <div className={`flex-1 ${activeView === 'aiStudio' ? 'overflow-hidden' : 'overflow-y-auto'}`}>
                         {activeView === 'explore' && <ExploreView onSelectTemplate={onSelectTemplate} searchQuery={searchQuery} aiTags={aiTags} />}
                         {activeView === 'projects' && <DashboardView onSelectProject={onSelectProject} />}
+                        {activeView === 'aiStudio' && (
+                            <div className="flex h-full w-full flex-col bg-slate-50">
+                                <AIStudioView />
+                            </div>
+                        )}
                     </div>
                 </main>
 
-                <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-20 w-full max-w-2xl px-4">
-                    <div className="relative bg-white/60 backdrop-blur-lg border border-slate-200/50 rounded-full shadow-2xl shadow-black/20">
-                        <div className="absolute left-6 top-1/2 -translate-y-1/2 pointer-events-none">
-                            {isSearching ? (
-                                <SparklesIcon className="w-6 h-6 text-emerald-500 animate-spin" />
-                            ) : (
-                                <SearchIcon className="w-6 h-6 text-gray-500" />
-                            )}
+                {activeView !== 'aiStudio' && (
+                    <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-20 w-full max-w-2xl px-4">
+                        <div className="relative bg-white/60 backdrop-blur-lg border border-slate-200/50 rounded-full shadow-2xl shadow-black/20">
+                            <div className="absolute left-6 top-1/2 -translate-y-1/2 pointer-events-none">
+                                {isSearching ? (
+                                    <SparklesIcon className="w-6 h-6 text-emerald-500 animate-spin" />
+                                ) : (
+                                    <SearchIcon className="w-6 h-6 text-gray-500" />
+                                )}
+                            </div>
+                            <input
+                                type="text"
+                                placeholder="what would you wish for"
+                                value={searchQuery}
+                                onChange={(e) => setSearchQuery(e.target.value)}
+                                className="w-full pl-16 pr-6 py-4 bg-transparent rounded-full focus:ring-2 focus:ring-emerald-500 focus:outline-none text-lg text-gray-800 placeholder-gray-500 transition-all duration-300 focus:placeholder-gray-400"
+                            />
                         </div>
-                        <input
-                            type="text"
-                            placeholder="what would you wish for"
-                            value={searchQuery}
-                            onChange={(e) => setSearchQuery(e.target.value)}
-                            className="w-full pl-16 pr-6 py-4 bg-transparent rounded-full focus:ring-2 focus:ring-emerald-500 focus:outline-none text-lg text-gray-800 placeholder-gray-500 transition-all duration-300 focus:placeholder-gray-400"
-                        />
                     </div>
-                </div>
+                )}
             </div>
             {isBrandKitModalOpen && <BrandKitSetupModal onClose={() => setIsBrandKitModalOpen(false)} />}
         </div>

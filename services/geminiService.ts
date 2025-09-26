@@ -243,6 +243,8 @@ const getAi = (): GoogleGenAI => {
     return ai;
 }
 
+export const getGeminiClient = (): GoogleGenAI => getAi();
+
 export interface EditToggles {
   [markId: string]: boolean;
 }

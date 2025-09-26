@@ -11,6 +11,22 @@
   font-display: swap;
 }
 
+:root {
+  --ai-surface-base: #f3f7f9;
+  --ai-surface-alt: #ffffff;
+  --ai-surface-muted: #ecfdf5;
+  --ai-surface-glass: rgba(255, 255, 255, 0.9);
+  --ai-border-subtle: #e2e8f0;
+  --ai-border-strong: #94a3b8;
+  --ai-shadow-soft: 0 12px 45px rgba(15, 23, 42, 0.08);
+  --ai-shadow-strong: 0 24px 65px rgba(45, 65, 87, 0.14);
+  --ai-text-strong: #0f172a;
+  --ai-text-muted: #475569;
+  --ai-accent: #10b981;
+  --ai-accent-strong: #059669;
+  --ai-focus-ring: 0 0 0 3px rgba(16, 185, 129, 0.35);
+}
+
 body {
   @apply bg-slate-100;
 }
@@ -116,4 +132,36 @@ body {
   border: none;
   box-sizing: border-box;
   pointer-events: none;
+}
+
+.bg-dot-pattern {
+  background-image: radial-gradient(rgba(15, 23, 42, 0.08) 1px, transparent 0);
+  background-size: 24px 24px;
+}
+
+.ai-glass-card {
+  background: var(--ai-surface-glass);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  box-shadow: var(--ai-shadow-soft);
+  backdrop-filter: blur(18px);
+}
+
+.ai-pill-button {
+  border-radius: 9999px;
+  padding: 0.625rem 1.25rem;
+  font-weight: 600;
+  transition: background-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+  background: var(--ai-accent);
+  color: white;
+}
+
+.ai-pill-button:hover {
+  background: var(--ai-accent-strong);
+  box-shadow: 0 12px 30px rgba(16, 185, 129, 0.35);
+  transform: translateY(-1px);
+}
+
+.ai-pill-button:focus-visible {
+  outline: none;
+  box-shadow: var(--ai-focus-ring);
 }

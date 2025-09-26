@@ -853,11 +853,6 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
   const readyIncludedMarks = useMemo(() => includedMarks.filter(mark => canEnableMark(mark.id)), [includedMarks, canEnableMark]);
 
-  const missingIncludedMarks = useMemo(() => {
-    const readyIds = new Set(readyIncludedMarks.map(mark => mark.id));
-    return includedMarks.filter(mark => !readyIds.has(mark.id));
-  }, [includedMarks, readyIncludedMarks]);
-
   const missingIncludedMarksCount = Math.max(0, includedMarks.length - readyIncludedMarks.length);
 
   const editableFields = useMemo(() => {
