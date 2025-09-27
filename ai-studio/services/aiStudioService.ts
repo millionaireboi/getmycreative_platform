@@ -3,6 +3,7 @@ import { Modality, Type } from "@google/genai";
 import type { Board, CanvasElement, ImageElement, OrchestrationPlan, ImageAnalysis, TextAnalysis, ProductAnalysis } from '../types';
 import { getGeminiClient } from '../../services/geminiService.ts';
 import { buildWhiteboardContextSummary } from './contextBuilder.ts';
+import { recordUsageEvent, type UsageEventStatus } from '../../services/usageLogger.ts';
 
 const API_KEY = (import.meta as any).env?.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
 
@@ -13,6 +14,49 @@ const getAi = (): GoogleGenAI => {
         cachedAi = getGeminiClient();
     }
     return cachedAi;
+};
+
+const now = () => (typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now());
+
+const countInlineImages = (result: { candidates?: Array<{ content?: { parts?: Array<{ inlineData?: { data?: string } }> } }> }): number => {
+    if (!result?.candidates) return 0;
+    return result.candidates.reduce((candidateTotal, candidate) => {
+        const parts = candidate?.content?.parts ?? [];
+        const inlineCount = parts.reduce((total, part) => (part?.inlineData?.data ? total + 1 : total), 0);
+        return candidateTotal + inlineCount;
+    }, 0);
+};
+
+const logGeminiUsage = (
+    params: {
+        actionType: string;
+        modelUsed: string;
+        result?: { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number } };
+        imageCount?: number;
+        status?: UsageEventStatus;
+        latencyMs: number;
+        error?: unknown;
+        extra?: Record<string, unknown>;
+    }
+): void => {
+    const { actionType, modelUsed, result, imageCount, status = 'success', latencyMs, error, extra } = params;
+    const usageMetadata = result?.usageMetadata;
+    const errorCode = status === 'error'
+        ? (error instanceof Error ? error.message : String(error ?? 'unknown'))
+        : undefined;
+
+    void recordUsageEvent({
+        actionType,
+        modelUsed,
+        status,
+        imageCount: typeof imageCount === 'number' ? imageCount : null,
+        inputTokenCount: usageMetadata?.promptTokenCount ?? null,
+        outputTokenCount: usageMetadata?.candidatesTokenCount ?? null,
+        totalTokenCount: usageMetadata?.totalTokenCount ?? null,
+        latencyMs,
+        errorCode,
+        extra,
+    });
 };
 
 const dataUrlToImageBytes = (dataUrl: string): { mimeType: string; data: string } => {
@@ -53,8 +97,11 @@ const fetchAsDataURL = async (url: string): Promise<string> => {
 };
 
 export const analyzeImageContent = async (src: string): Promise<ImageAnalysis> => {
+    const requestStartedAt = now();
+    let apiResult: any;
+    let apiLatencyMs = 0;
     try {
-        const response = await getAi().models.generateContent({
+        apiResult = await getAi().models.generateContent({
             model: 'gemini-2.5-flash',
             contents: {
                 parts: [
@@ -77,20 +124,44 @@ export const analyzeImageContent = async (src: string): Promise<ImageAnalysis> =
                 }
             }
         });
-        const jsonStr = response.text?.trim();
+        apiLatencyMs = now() - requestStartedAt;
+        const jsonStr = apiResult.text?.trim();
         if (!jsonStr) {
             throw new Error('Image analysis response contained no text.');
         }
-        return JSON.parse(jsonStr) as ImageAnalysis;
+        const parsed = JSON.parse(jsonStr) as ImageAnalysis;
+        logGeminiUsage({
+            actionType: 'aiStudio.analyzeImageContent',
+            modelUsed: 'gemini-2.5-flash',
+            result: apiResult,
+            imageCount: 0,
+            latencyMs: apiLatencyMs,
+        });
+        return parsed;
     } catch (error) {
         console.error("Error analyzing image:", error);
+        if (apiLatencyMs === 0) {
+            apiLatencyMs = now() - requestStartedAt;
+        }
+        logGeminiUsage({
+            actionType: 'aiStudio.analyzeImageContent',
+            modelUsed: 'gemini-2.5-flash',
+            result: apiResult,
+            imageCount: 0,
+            latencyMs: apiLatencyMs,
+            status: 'error',
+            error,
+        });
         return {}; // Return empty object on failure
     }
 };
 
 export const analyzeProductImageContent = async (src: string): Promise<ProductAnalysis> => {
+    const requestStartedAt = now();
+    let apiResult: any;
+    let apiLatencyMs = 0;
     try {
-        const response = await getAi().models.generateContent({
+        apiResult = await getAi().models.generateContent({
             model: 'gemini-2.5-flash',
             contents: {
                 parts: [
@@ -111,20 +182,44 @@ export const analyzeProductImageContent = async (src: string): Promise<ProductAn
                 }
             }
         });
-        const jsonStr = response.text?.trim();
+        apiLatencyMs = now() - requestStartedAt;
+        const jsonStr = apiResult.text?.trim();
         if (!jsonStr) {
             throw new Error('Product analysis response contained no text.');
         }
-        return JSON.parse(jsonStr) as ProductAnalysis;
+        const parsed = JSON.parse(jsonStr) as ProductAnalysis;
+        logGeminiUsage({
+            actionType: 'aiStudio.analyzeProductImageContent',
+            modelUsed: 'gemini-2.5-flash',
+            result: apiResult,
+            imageCount: 0,
+            latencyMs: apiLatencyMs,
+        });
+        return parsed;
     } catch (error) {
         console.error("Error analyzing product image:", error);
+        if (apiLatencyMs === 0) {
+            apiLatencyMs = now() - requestStartedAt;
+        }
+        logGeminiUsage({
+            actionType: 'aiStudio.analyzeProductImageContent',
+            modelUsed: 'gemini-2.5-flash',
+            result: apiResult,
+            imageCount: 0,
+            latencyMs: apiLatencyMs,
+            status: 'error',
+            error,
+        });
         return {}; // Return empty object on failure
     }
 };
 
 export const removeImageBackground = async (src: string): Promise<string> => {
+    const requestStartedAt = now();
+    let apiLatencyMs = 0;
+    let apiResult: any;
     try {
-        const response = await getAi().models.generateContent({
+        apiResult = await getAi().models.generateContent({
             model: 'gemini-2.5-flash-image-preview',
             contents: {
                 parts: [
@@ -136,8 +231,11 @@ export const removeImageBackground = async (src: string): Promise<string> => {
                 responseModalities: [Modality.IMAGE],
             },
         });
+        apiLatencyMs = now() - requestStartedAt;
 
-        const candidates = response.candidates ?? [];
+        const inlineImageCount = countInlineImages(apiResult);
+
+        const candidates = apiResult.candidates ?? [];
         for (const candidate of candidates) {
             const parts = candidate.content?.parts ?? [];
             for (const part of parts) {
@@ -145,6 +243,13 @@ export const removeImageBackground = async (src: string): Promise<string> => {
                 if (inlineData?.data && inlineData.mimeType) {
                     const base64ImageBytes = inlineData.data;
                     const mimeType = inlineData.mimeType;
+                    logGeminiUsage({
+                        actionType: 'aiStudio.removeImageBackground',
+                        modelUsed: 'gemini-2.5-flash-image-preview',
+                        result: apiResult,
+                        imageCount: inlineImageCount,
+                        latencyMs: apiLatencyMs,
+                    });
                     return `data:${mimeType};base64,${base64ImageBytes}`;
                 }
             }
@@ -153,14 +258,29 @@ export const removeImageBackground = async (src: string): Promise<string> => {
 
     } catch (error) {
         console.error("Error removing image background:", error);
+        if (apiLatencyMs === 0) {
+            apiLatencyMs = now() - requestStartedAt;
+        }
+        logGeminiUsage({
+            actionType: 'aiStudio.removeImageBackground',
+            modelUsed: 'gemini-2.5-flash-image-preview',
+            result: apiResult,
+            imageCount: apiResult ? countInlineImages(apiResult) : 0,
+            latencyMs: apiLatencyMs,
+            status: 'error',
+            error,
+        });
         throw new Error("Failed to remove background from image.");
     }
 };
 
 
 export const analyzeTextContent = async (text: string): Promise<TextAnalysis> => {
+    const requestStartedAt = now();
+    let apiResult: any;
+    let apiLatencyMs = 0;
     try {
-        const response = await getAi().models.generateContent({
+        apiResult = await getAi().models.generateContent({
             model: 'gemini-2.5-flash',
             contents: `Analyze this text: "${text}". Describe its sentiment, key keywords, and writing style.`,
             config: {
@@ -175,13 +295,36 @@ export const analyzeTextContent = async (text: string): Promise<TextAnalysis> =>
                 }
             }
         });
-        const jsonStr = response.text?.trim();
+        apiLatencyMs = now() - requestStartedAt;
+        const jsonStr = apiResult.text?.trim();
         if (!jsonStr) {
             throw new Error('Text analysis response contained no text.');
         }
-        return JSON.parse(jsonStr) as TextAnalysis;
+        const parsed = JSON.parse(jsonStr) as TextAnalysis;
+        logGeminiUsage({
+            actionType: 'aiStudio.analyzeTextContent',
+            modelUsed: 'gemini-2.5-flash',
+            result: apiResult,
+            imageCount: 0,
+            latencyMs: apiLatencyMs,
+            extra: { textLength: text.length },
+        });
+        return parsed;
     } catch (error) {
         console.error("Error analyzing text:", error);
+        if (apiLatencyMs === 0) {
+            apiLatencyMs = now() - requestStartedAt;
+        }
+        logGeminiUsage({
+            actionType: 'aiStudio.analyzeTextContent',
+            modelUsed: 'gemini-2.5-flash',
+            result: apiResult,
+            imageCount: 0,
+            latencyMs: apiLatencyMs,
+            status: 'error',
+            error,
+            extra: { textLength: text.length },
+        });
         return {}; // Return empty object on failure
     }
 };
@@ -195,6 +338,7 @@ export const generateVideo = async (
         throw new Error("Gemini API key is not configured.");
     }
 
+    const requestStartedAt = now();
     try {
         onProgress('Initiating video generation...');
         
@@ -258,10 +402,35 @@ export const generateVideo = async (
             imageSrc ? Promise.resolve(imageSrc) : generateImage(prompt),
         ]);
 
+        recordUsageEvent({
+            actionType: 'aiStudio.generateVideo',
+            modelUsed: 'veo-2.0-generate-001',
+            imageCount: 1,
+            latencyMs: now() - requestStartedAt,
+            videoSeconds: videoInfo?.video?.duration ? Number(videoInfo.video.duration) : undefined,
+            extra: {
+                providedImage: Boolean(imageSrc),
+            },
+        });
+
         return { videoUrl, posterUrl };
     } catch (error) {
         console.error("Error generating video:", error);
-        if (error instanceof Error && error.message.toLowerCase().includes('safety')) {
+        const latencyMs = now() - requestStartedAt;
+        const errorMessage = error instanceof Error ? error.message : String(error ?? 'unknown');
+        const isSafety = error instanceof Error && error.message.toLowerCase().includes('safety');
+        recordUsageEvent({
+            actionType: 'aiStudio.generateVideo',
+            modelUsed: 'veo-2.0-generate-001',
+            status: 'error',
+            latencyMs,
+            errorCode: errorMessage,
+            videoSeconds: videoInfo?.video?.duration ? Number(videoInfo.video.duration) : undefined,
+            extra: {
+                providedImage: Boolean(imageSrc),
+            },
+        });
+        if (isSafety) {
              throw new Error("Video generation was blocked for safety reasons. Please try a different prompt.");
         }
         throw new Error("Failed to generate video.");
@@ -278,6 +447,9 @@ const assembleCreative = async (
     },
     brandInfo?: { colors?: string[]; logo?: ImageElement }
 ): Promise<string> => {
+    const requestStartedAt = now();
+    let apiResult: any;
+    let apiLatencyMs = 0;
     try {
         const sourceImages = assets.sourceElements.filter(el => el.type === 'image') as ImageElement[];
         
@@ -293,7 +465,7 @@ const assembleCreative = async (
         const imageParts = imagesToInclude.map(el => imageToPart(el.src));
 
         // The prompt is now used directly as it contains the full, dynamic brief from the Creative Director AI.
-        const response = await getAi().models.generateContent({
+        apiResult = await getAi().models.generateContent({
             model: 'gemini-2.5-flash-image-preview',
             contents: {
                 parts: [
@@ -306,9 +478,10 @@ const assembleCreative = async (
                 responseModalities: [Modality.IMAGE, Modality.TEXT],
             },
         });
+        apiLatencyMs = now() - requestStartedAt;
 
         const finalImages: string[] = [];
-        const candidates = response.candidates ?? [];
+        const candidates = apiResult.candidates ?? [];
         for (const candidate of candidates) {
             const parts = candidate.content?.parts ?? [];
             for (const part of parts) {
@@ -325,17 +498,40 @@ const assembleCreative = async (
             throw new Error("The AI did not return any remixed images. This can happen due to safety filters. Please adjust your prompt.");
         }
 
+        logGeminiUsage({
+            actionType: 'aiStudio.assembleCreative',
+            modelUsed: 'gemini-2.5-flash-image-preview',
+            result: apiResult,
+            imageCount: finalImages.length,
+            latencyMs: apiLatencyMs,
+            extra: {
+                sourceImages: sourceImages.length,
+                mentionsCount: mentions.length,
+                hasBrandLogo: Boolean(brandInfo?.logo),
+            },
+        });
+
         return finalImages[0];
     } catch (error) {
         console.error("Error assembling creative:", error);
         if (error instanceof Error && error.message.toLowerCase().includes('responsible ai')) {
             throw new Error("Image remixing was blocked for safety reasons. Please try a different prompt.");
         }
+        logGeminiUsage({
+            actionType: 'aiStudio.assembleCreative',
+            modelUsed: 'gemini-2.5-flash-image-preview',
+            result: apiResult,
+            imageCount: 0,
+            latencyMs: apiLatencyMs || (now() - requestStartedAt),
+            status: 'error',
+            error,
+        });
         throw new Error("Failed to remix content.");
     }
 };
 
 export const generateImage = async (prompt: string): Promise<string> => {
+    const requestStartedAt = now();
     try {
         let finalPrompt = prompt;
         const socialMediaKeywords = ['social media', 'instagram post', 'facebook ad', 'creative', 'post', 'ad'];
@@ -355,6 +551,15 @@ export const generateImage = async (prompt: string): Promise<string> => {
 
         const firstImageBytes = response.generatedImages?.[0]?.image?.imageBytes;
         if (firstImageBytes) {
+            recordUsageEvent({
+                actionType: 'aiStudio.generateImage',
+                modelUsed: 'imagen-4.0-generate-001',
+                imageCount: 1,
+                latencyMs: now() - requestStartedAt,
+                extra: {
+                    promptLength: finalPrompt.length,
+                },
+            });
             return `data:image/png;base64,${firstImageBytes}`;
         }
         throw new Error("The AI returned no images. This can happen due to safety filters. Please try rephrasing your prompt.");
@@ -375,14 +580,24 @@ export const generateImage = async (prompt: string): Promise<string> => {
                 }
             }
         }
+        recordUsageEvent({
+            actionType: 'aiStudio.generateImage',
+            modelUsed: 'imagen-4.0-generate-001',
+            status: 'error',
+            latencyMs: now() - requestStartedAt,
+            errorCode: error instanceof Error ? error.message : String(error ?? 'unknown'),
+        });
         throw new Error(errorMessage);
     }
 };
 
 export const generateTextVariations = async (prompt: string, style?: string): Promise<string[]> => {
+    const requestStartedAt = now();
+    let apiResult: any;
+    let apiLatencyMs = 0;
     try {
         const fullPrompt = `You are a creative copywriter. Based on the theme "${prompt}"${style ? ` and the desired style "${style}"` : ''}, generate 4 distinct, short text variations. These could be headlines, slogans, or short descriptions. The tone should be creative and engaging. Return the result as a JSON array of strings.`;
-        const response = await getAi().models.generateContent({
+        apiResult = await getAi().models.generateContent({
             model: 'gemini-2.5-flash',
             contents: fullPrompt,
             config: {
@@ -399,24 +614,55 @@ export const generateTextVariations = async (prompt: string, style?: string): Pr
                 },
             },
         });
-        const jsonStr = response.text?.trim();
+        apiLatencyMs = now() - requestStartedAt;
+        const jsonStr = apiResult.text?.trim();
         if (!jsonStr) {
             throw new Error('Text variation response contained no text.');
         }
         const result = JSON.parse(jsonStr);
+        logGeminiUsage({
+            actionType: 'aiStudio.generateTextVariations',
+            modelUsed: 'gemini-2.5-flash',
+            result: apiResult,
+            imageCount: 0,
+            latencyMs: apiLatencyMs,
+            extra: {
+                promptLength: prompt.length,
+                styleProvided: Boolean(style),
+            },
+        });
         return result.variations as string[];
     } catch (error) {
         console.error("Error generating text variations:", error);
         if (error instanceof Error && error.message.toLowerCase().includes('safety')) {
             throw new Error("Text generation was blocked for safety reasons. Please try a different prompt.");
         }
+        if (apiLatencyMs === 0) {
+            apiLatencyMs = now() - requestStartedAt;
+        }
+        logGeminiUsage({
+            actionType: 'aiStudio.generateTextVariations',
+            modelUsed: 'gemini-2.5-flash',
+            result: apiResult,
+            imageCount: 0,
+            latencyMs: apiLatencyMs,
+            status: 'error',
+            error,
+            extra: {
+                promptLength: prompt.length,
+                styleProvided: Boolean(style),
+            },
+        });
         throw new Error("Failed to generate text variations.");
     }
 };
 
 const generateColorPalette = async (prompt: string): Promise<string[]> => {
+    const requestStartedAt = now();
+    let apiResult: any;
+    let apiLatencyMs = 0;
     try {
-        const response = await getAi().models.generateContent({
+        apiResult = await getAi().models.generateContent({
             model: 'gemini-2.5-flash',
             contents: `Generate a 5-color palette based on the theme: "${prompt}". Return the result as a JSON object containing an array of 5 hex color code strings.`,
             config: {
@@ -433,14 +679,36 @@ const generateColorPalette = async (prompt: string): Promise<string[]> => {
                 },
             },
         });
-        const jsonStr = response.text?.trim();
+        apiLatencyMs = now() - requestStartedAt;
+        const jsonStr = apiResult.text?.trim();
         if (!jsonStr) {
             throw new Error('Color palette response contained no text.');
         }
         const result = JSON.parse(jsonStr);
+        logGeminiUsage({
+            actionType: 'aiStudio.generateColorPalette',
+            modelUsed: 'gemini-2.5-flash',
+            result: apiResult,
+            imageCount: 0,
+            latencyMs: apiLatencyMs,
+            extra: { promptLength: prompt.length },
+        });
         return result.palette as string[];
     } catch (error) {
         console.error("Error generating color palette:", error);
+        if (apiLatencyMs === 0) {
+            apiLatencyMs = now() - requestStartedAt;
+        }
+        logGeminiUsage({
+            actionType: 'aiStudio.generateColorPalette',
+            modelUsed: 'gemini-2.5-flash',
+            result: apiResult,
+            imageCount: 0,
+            latencyMs: apiLatencyMs,
+            status: 'error',
+            error,
+            extra: { promptLength: prompt.length },
+        });
         throw new Error("Failed to generate color palette.");
     }
 };
@@ -514,46 +782,71 @@ export const orchestrateRemix = async (
       Return a single JSON object with a 'tasks' array containing exactly four 'socialMediaTemplate' tasks, each with its own detailed prompt. Do not include any other task types.
     `;
 
-    const planResponse = await getAi().models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: {
-            parts: [
-                { text: plannerPrompt },
-                ...logoPart,
-                ...imageParts,
-            ],
-        },
-        config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                    tasks: {
-                        type: Type.ARRAY,
-                        items: {
-                            type: Type.OBJECT,
-                            properties: {
-                                id: { type: Type.STRING },
-                                type: { type: Type.STRING },
-                                description: { type: Type.STRING },
-                                prompt: { type: Type.STRING },
-                                dependencies: { type: Type.ARRAY, items: { type: Type.STRING } },
+    const plannerStartedAt = now();
+    let plannerResult: any;
+    let plannerLatencyMs = 0;
+    try {
+        plannerResult = await getAi().models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: {
+                parts: [
+                    { text: plannerPrompt },
+                    ...logoPart,
+                    ...imageParts,
+                ],
+            },
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                        tasks: {
+                            type: Type.ARRAY,
+                            items: {
+                                type: Type.OBJECT,
+                                properties: {
+                                    id: { type: Type.STRING },
+                                    type: { type: Type.STRING },
+                                    description: { type: Type.STRING },
+                                    prompt: { type: Type.STRING },
+                                    dependencies: { type: Type.ARRAY, items: { type: Type.STRING } },
+                                },
+                                required: ["id", "type", "description", "prompt", "dependencies"],
                             },
-                            required: ["id", "type", "description", "prompt", "dependencies"],
                         },
                     },
+                    required: ["tasks"],
                 },
-                required: ["tasks"],
             },
-        },
-    });
-
-    const planJson = planResponse.text?.trim();
+        });
+    } catch (error) {
+        plannerLatencyMs = now() - plannerStartedAt;
+        logGeminiUsage({
+            actionType: 'aiStudio.orchestrateRemix.plan',
+            modelUsed: 'gemini-2.5-flash',
+            result: plannerResult,
+            imageCount: 0,
+            latencyMs: plannerLatencyMs,
+            status: 'error',
+            error,
+        });
+        throw error;
+    }
+    plannerLatencyMs = now() - plannerStartedAt;
+    const planJson = plannerResult.text?.trim();
     if (!planJson) {
         throw new Error('Planner response contained no text.');
     }
 
     const plan: OrchestrationPlan = JSON.parse(planJson);
+    logGeminiUsage({
+        actionType: 'aiStudio.orchestrateRemix.plan',
+        modelUsed: 'gemini-2.5-flash',
+        result: plannerResult,
+        imageCount: 0,
+        latencyMs: plannerLatencyMs,
+        extra: { tasksCount: plan.tasks?.length ?? 0 },
+    });
     
     // 3. Execution Phase
     onProgress?.('Creative Director has prepared 4 creative briefs. Executing...');

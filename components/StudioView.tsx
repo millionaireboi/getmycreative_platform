@@ -8,11 +8,12 @@ import { getAllProjects } from '../core/systems/projectStore.ts';
 import { isApiConfigured } from '../services/geminiService.ts';
 import { firebaseConfig, uploadFileToStorage } from '../firebase/config.ts';
 import { ProfileDropdown } from './Header.tsx';
+import { UsageDashboard } from './UsageDashboard.tsx';
 import { EditIcon, SparklesIcon, UploadCloudIcon, XIcon, SearchIcon, TrendingUpIcon, EyeIcon, DollarSignIcon, UsersIcon, FileTextIcon, ClockIcon, CheckCircleIcon, AlertTriangleIcon, TrashIcon } from './icons.tsx';
 import { fileToBase64, fileToDataUrl } from '../utils/fileUtils.ts';
 import { detectEditableRegions, generateTemplateMetadata, generateTemplateStyleSnapshot } from '../services/geminiService.ts';
 
-type StudioTab = 'dashboard' | 'myTemplates' | 'analytics' | 'reviewQueue' | 'userManagement';
+type StudioTab = 'dashboard' | 'usage' | 'myTemplates' | 'analytics' | 'reviewQueue' | 'userManagement';
 
 const getStatusPill = (status: TemplateStatus) => {
     switch(status) {
@@ -155,7 +156,7 @@ interface StudioViewProps {
 
 export const StudioView = ({ onNavigateToEditor }: StudioViewProps) => {
     const { appUser, loading } = useAuth();
-    const [activeTab, setActiveTab] = useState<StudioTab>('myTemplates');
+    const [activeTab, setActiveTab] = useState<StudioTab>(appUser?.role === UserRole.ADMIN ? 'dashboard' : 'myTemplates');
 
     const [myTemplates, setMyTemplates] = useState<UITemplate[]>([]);
     const [reviewQueue, setReviewQueue] = useState<Template[]>([]);
@@ -599,8 +600,13 @@ export const StudioView = ({ onNavigateToEditor }: StudioViewProps) => {
                     <ProfileDropdown />
                 </header>
 
-                <div className="flex border-b mb-6">
-                    {isAdmin && <button onClick={() => setActiveTab('dashboard')} className={`px-4 py-2 font-medium ${activeTab === 'dashboard' ? 'border-b-2 border-emerald-500 text-emerald-600' : 'text-gray-500'}`}>Dashboard</button>}
+                <div className="flex border-b mb-6 flex-wrap gap-2">
+                    {isAdmin && (
+                        <>
+                            <button onClick={() => setActiveTab('dashboard')} className={`px-4 py-2 font-medium ${activeTab === 'dashboard' ? 'border-b-2 border-emerald-500 text-emerald-600' : 'text-gray-500'}`}>Dashboard</button>
+                            <button onClick={() => setActiveTab('usage')} className={`px-4 py-2 font-medium ${activeTab === 'usage' ? 'border-b-2 border-emerald-500 text-emerald-600' : 'text-gray-500'}`}>Usage & Costing</button>
+                        </>
+                    )}
                     {isDesigner && <button onClick={() => setActiveTab('myTemplates')} className={`px-4 py-2 font-medium ${activeTab === 'myTemplates' ? 'border-b-2 border-emerald-500 text-emerald-600' : 'text-gray-500'}`}>My Templates</button>}
                     {isDesigner && <button onClick={() => setActiveTab('analytics')} className={`px-4 py-2 font-medium ${activeTab === 'analytics' ? 'border-b-2 border-emerald-500 text-emerald-600' : 'text-gray-500'}`}>Analytics</button>}
                     {isAdmin && <button onClick={() => setActiveTab('reviewQueue')} className={`px-4 py-2 font-medium ${activeTab === 'reviewQueue' ? 'border-b-2 border-emerald-500 text-emerald-600' : 'text-gray-500'}`}>Review Queue</button>}
@@ -610,6 +616,11 @@ export const StudioView = ({ onNavigateToEditor }: StudioViewProps) => {
                 {isLoading ? <p>Loading...</p> : (
                     <div>
                         {activeTab === 'dashboard' && isAdmin && renderDashboard()}
+                        {activeTab === 'usage' && isAdmin && (
+                            <div className="bg-slate-50 border border-slate-200 rounded-xl p-4">
+                                <UsageDashboard />
+                            </div>
+                        )}
                         {activeTab === 'myTemplates' && isDesigner && renderMyTemplates()}
                         {activeTab === 'analytics' && isDesigner && renderAnalytics()}
                         {activeTab === 'reviewQueue' && isAdmin && renderReviewQueue()}

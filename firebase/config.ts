@@ -8,6 +8,20 @@ import { getFirestore } from "firebase/firestore";
 // a critical module shadowing issue caused by a local 'firebase/storage.ts' file.
 import { getStorage, ref, getDownloadURL, uploadBytesResumable } from "firebase/storage";
 
+const logStorageUsage = async (bytes: number, path: string) => {
+  try {
+    const module = await import('../services/usageLogger.ts');
+    await module.recordUsageEvent({
+      actionType: 'storageUpload',
+      modelUsed: 'firebase-storage',
+      gcsBytesStored: bytes,
+      extra: { path },
+    });
+  } catch (error) {
+    console.warn('Failed to log storage usage', error);
+  }
+};
+
 // --- START: ADD YOUR FIREBASE CONFIGURATION HERE ---
 // Replace the placeholder values below with the configuration from your own Firebase project.
 // You can find this in your Firebase project settings under "General".
@@ -88,6 +102,7 @@ export const uploadFileToStorage = (
       () => {
         // Upload completed successfully, now we can get the download URL
         getDownloadURL(uploadTask.snapshot.ref).then((downloadURL) => {
+          void logStorageUsage(uploadTask.snapshot.totalBytes, `${path}/${fileName}`);
           resolve(downloadURL);
         }).catch(reject);
       }

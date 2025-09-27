@@ -4,6 +4,7 @@ import { onAuthStateChanged } from 'firebase/auth';
 import { auth } from '../firebase/config.ts';
 import { User } from '../core/types/index.ts';
 import { getUserProfile, upgradeUserToPro, updateUserBrandColors } from '../core/systems/identity.ts';
+import { setCachedUser } from '../core/systems/identityCache.ts';
 import { isApiConfigured } from '../services/geminiService.ts';
 
 
@@ -34,14 +35,17 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           // Await the profile and set the user
           const profile = await getUserProfile(firebaseUser);
           setAppUser(profile);
+          setCachedUser(profile);
         } else {
           // No user, so set to null
           setAppUser(null);
+          setCachedUser(null);
         }
       } catch (error) {
         // If there's an error fetching the profile, log it and treat the user as logged out
         console.error("Authentication Error: Failed to retrieve user profile.", error);
         setAppUser(null);
+        setCachedUser(null);
       } finally {
         // Always set loading to false after attempting to get the user state
         setLoading(false);

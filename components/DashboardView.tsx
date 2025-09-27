@@ -3,6 +3,7 @@ import { useAuth } from '../contexts/AuthContext.tsx';
 import { Project } from '../core/types/index.ts';
 import { getUserProjects, deleteProject } from '../core/systems/projectStore.ts';
 import { SparklesIcon, TrashIcon } from './icons.tsx';
+import { UsageDashboard } from './UsageDashboard.tsx';
 
 const DUMMY_PROJECTS: Project[] = [
     { id: 'dummy-1', name: 'Summer Sale Campaign', userId: 'dummy', templateId: '1', templateImageUrl: 'https://picsum.photos/seed/dummy1/500/600', basePrompt: '', initialMarks: [], history: [{ id: 'h1', imageUrl: 'https://picsum.photos/seed/dummy1/500/600', prompt: '' }], createdAt: new Date(Date.now() - 86400000 * 3), updatedAt: new Date(Date.now() - 86400000 * 1) },
@@ -63,6 +64,7 @@ export const DashboardView = ({ onSelectProject }: DashboardViewProps) => {
     const [projects, setProjects] = useState<Project[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [isShowingSamples, setIsShowingSamples] = useState(false);
+    const [activeTab, setActiveTab] = useState<'projects' | 'usage'>('projects');
 
     const fetchProjects = async () => {
         if (appUser) {
@@ -92,8 +94,8 @@ export const DashboardView = ({ onSelectProject }: DashboardViewProps) => {
         return <div className="text-center py-16">Loading projects...</div>;
     }
 
-    return (
-        <div className="container mx-auto px-4 py-8">
+    const renderProjectsTab = () => (
+        <div>
             {isShowingSamples && (
                 <div className="bg-emerald-50 text-emerald-800 p-4 rounded-lg mb-6 text-center text-sm border border-emerald-200">
                     <p>Welcome! Here are some sample projects to show you what's possible. <br/>Create your first masterpiece from the <b>Explore</b> page!</p>
@@ -117,6 +119,35 @@ export const DashboardView = ({ onSelectProject }: DashboardViewProps) => {
                     <p className="text-gray-500 mt-2">You can create a new project from the Explore page.</p>
                 </div>
             )}
+        </div>
+    );
+
+    const renderUsageTab = () => (
+        <UsageDashboard />
+    );
+
+    return (
+        <div className="container mx-auto px-4 py-8">
+            <div className="flex items-center gap-2 mb-6 border-b border-slate-200">
+                <button
+                    className={`px-4 py-2 text-sm font-medium transition-colors rounded-t ${activeTab === 'projects' ? 'bg-white text-slate-900 border border-b-white border-slate-200' : 'text-slate-500 hover:text-slate-800'}`}
+                    onClick={() => setActiveTab('projects')}
+                >
+                    Projects
+                </button>
+                {appUser?.role === 'ADMIN' && (
+                    <button
+                        className={`px-4 py-2 text-sm font-medium transition-colors rounded-t ${activeTab === 'usage' ? 'bg-white text-slate-900 border border-b-white border-slate-200' : 'text-slate-500 hover:text-slate-800'}`}
+                        onClick={() => setActiveTab('usage')}
+                    >
+                        Usage & Costing
+                    </button>
+                )}
+            </div>
+
+            <div className="bg-white border border-slate-200 rounded-b-lg shadow-sm p-4 md:p-6">
+                {activeTab === 'projects' ? renderProjectsTab() : renderUsageTab()}
+            </div>
         </div>
     );
 };
