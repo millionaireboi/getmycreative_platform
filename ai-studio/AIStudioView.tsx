@@ -20,7 +20,8 @@ import { generateImage, orchestrateRemix, generateVideo, generateTextVariations,
 import { sendGenieMessage } from './services/genieService.ts';
 import { isApiConfigured } from '../services/geminiService.ts';
 import type { CanvasElement, ImageElement, TextElement, Board, BoardType, Connector } from './types.ts';
-import { LogoIcon, LoadingSpinner } from './components/icons.tsx';
+import { LogoIcon } from './components/icons.tsx';
+import { AiLoadingIndicator } from '../components/AiLoadingIndicator.tsx';
 import { ArrowLeftIcon } from '../components/icons.tsx';
 import { findElement, findElementAndParent } from './utils/elementUtils.ts';
 import { MOTION_TOKEN, prefersReducedMotion } from './utils/motion.ts';
@@ -1136,7 +1137,7 @@ const AIStudioViewComponent: React.FC<AIStudioViewProps> = ({ onBack }) => {
       {loadingMessage && (
         <div className="absolute bottom-28 left-1/2 z-30 -translate-x-1/2 rounded-full border border-emerald-100 bg-white/95 px-5 py-2 text-sm font-medium text-emerald-700 shadow-lg shadow-emerald-100/50 backdrop-blur">
           <div className="flex items-center gap-2">
-            <LoadingSpinner />
+            <AiLoadingIndicator size={40} ariaLabel="Generating" />
             <span>{loadingMessage}</span>
           </div>
         </div>

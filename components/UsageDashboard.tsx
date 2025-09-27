@@ -23,6 +23,7 @@ type UsageEvent = {
   errorCode: string | null;
   extra: Record<string, unknown> | null;
   estimatedCostUsd?: number | null;
+  requestId?: string | null;
 };
 
 type FilterState = {
@@ -74,6 +75,7 @@ export const UsageDashboard: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [limitCount, setLimitCount] = useState<number>(100);
   const [expandedUsers, setExpandedUsers] = useState<Record<string, boolean>>({});
+  const [expandedRequests, setExpandedRequests] = useState<Record<string, Record<string, boolean>>>({});
 
   const loadEvents = async () => {
     setIsLoading(true);
@@ -136,7 +138,19 @@ export const UsageDashboard: React.FC = () => {
           totalTokensOut: number;
           totalImages: number;
           totalStorageBytes: number;
-          events: UsageEvent[];
+          requests: Map<string, {
+            requestId: string;
+            primaryAction: string;
+            totalCost: number;
+            totalEvents: number;
+            totalTokensIn: number;
+            totalTokensOut: number;
+            totalImages: number;
+            totalStorageBytes: number;
+            firstTimestamp?: Timestamp | null;
+            lastTimestamp?: Timestamp | null;
+            events: UsageEvent[];
+          }>;
         }>(),
       };
     }
@@ -151,7 +165,19 @@ export const UsageDashboard: React.FC = () => {
       totalTokensOut: number;
       totalImages: number;
       totalStorageBytes: number;
-      events: UsageEvent[];
+      requests: Map<string, {
+        requestId: string;
+        primaryAction: string;
+        totalCost: number;
+        totalEvents: number;
+        totalTokensIn: number;
+        totalTokensOut: number;
+        totalImages: number;
+        totalStorageBytes: number;
+        firstTimestamp?: Timestamp | null;
+        lastTimestamp?: Timestamp | null;
+        events: UsageEvent[];
+      }>;
     }>();
     let totalImages = 0;
     let totalTokensIn = 0;
@@ -181,7 +207,7 @@ export const UsageDashboard: React.FC = () => {
         totalTokensOut: 0,
         totalImages: 0,
         totalStorageBytes: 0,
-        events: [],
+        requests: new Map(),
       };
       userAggregate.subscriptionTier = event.subscriptionTier ?? userAggregate.subscriptionTier;
       userAggregate.totalCost += event.estimatedCostUsd ?? 0;
@@ -190,7 +216,36 @@ export const UsageDashboard: React.FC = () => {
       userAggregate.totalTokensOut += event.outputTokenCount ?? 0;
       userAggregate.totalImages += event.imageCount ?? 0;
       userAggregate.totalStorageBytes += event.gcsBytesStored ?? 0;
-      userAggregate.events.push(event);
+
+      const requestKey = (event.requestId ?? event.extra?.requestId ?? event.id) as string;
+      const requestAggregate = userAggregate.requests.get(requestKey) ?? {
+        requestId: requestKey,
+        primaryAction: event.actionType,
+        totalCost: 0,
+        totalEvents: 0,
+        totalTokensIn: 0,
+        totalTokensOut: 0,
+        totalImages: 0,
+        totalStorageBytes: 0,
+        firstTimestamp: event.timestamp ?? null,
+        lastTimestamp: event.timestamp ?? null,
+        events: [],
+      };
+      requestAggregate.primaryAction = requestAggregate.primaryAction || event.actionType;
+      requestAggregate.totalCost += event.estimatedCostUsd ?? 0;
+      requestAggregate.totalEvents += 1;
+      requestAggregate.totalTokensIn += event.inputTokenCount ?? 0;
+      requestAggregate.totalTokensOut += event.outputTokenCount ?? 0;
+      requestAggregate.totalImages += event.imageCount ?? 0;
+      requestAggregate.totalStorageBytes += event.gcsBytesStored ?? 0;
+      if (!requestAggregate.firstTimestamp || (event.timestamp && event.timestamp.toMillis() < requestAggregate.firstTimestamp.toMillis())) {
+        requestAggregate.firstTimestamp = event.timestamp;
+      }
+      if (!requestAggregate.lastTimestamp || (event.timestamp && event.timestamp.toMillis() > requestAggregate.lastTimestamp.toMillis())) {
+        requestAggregate.lastTimestamp = event.timestamp;
+      }
+      requestAggregate.events.push(event);
+      userAggregate.requests.set(requestKey, requestAggregate);
       byUser.set(userKey, userAggregate);
     });
 
@@ -308,7 +363,17 @@ export const UsageDashboard: React.FC = () => {
             isLoading={isLoading}
             userAggregates={aggregated.byUser}
             expandedUsers={expandedUsers}
+            expandedRequests={expandedRequests}
             onToggleUser={userId => setExpandedUsers(prev => ({ ...prev, [userId]: !prev[userId] }))}
+            onToggleRequest={(userId, requestId) =>
+              setExpandedRequests(prev => ({
+                ...prev,
+                [userId]: {
+                  ...(prev[userId] ?? {}),
+                  [requestId]: !prev[userId]?.[requestId],
+                },
+              }))
+            }
           />
         </div>
 
@@ -411,7 +476,9 @@ const UserTable = ({
   isLoading,
   userAggregates,
   expandedUsers,
+  expandedRequests,
   onToggleUser,
+  onToggleRequest,
 }: {
   isLoading: boolean;
   userAggregates: Map<string, {
@@ -423,10 +490,24 @@ const UserTable = ({
     totalTokensOut: number;
     totalImages: number;
     totalStorageBytes: number;
-    events: UsageEvent[];
+    requests: Map<string, {
+      requestId: string;
+      primaryAction: string;
+      totalCost: number;
+      totalEvents: number;
+      totalTokensIn: number;
+      totalTokensOut: number;
+      totalImages: number;
+      totalStorageBytes: number;
+      firstTimestamp?: Timestamp | null;
+      lastTimestamp?: Timestamp | null;
+      events: UsageEvent[];
+    }>;
   }>;
   expandedUsers: Record<string, boolean>;
+  expandedRequests: Record<string, Record<string, boolean>>;
   onToggleUser: (userId: string) => void;
+  onToggleRequest: (userId: string, requestId: string) => void;
 }) => {
   if (isLoading) {
     return <div className="p-6 text-center text-slate-500">Loading usage events…</div>;
@@ -456,6 +537,12 @@ const UserTable = ({
         <tbody>
           {rows.map(user => {
             const isExpanded = expandedUsers[user.userId];
+            const requestRows = Array.from(user.requests.values()).sort((a, b) => {
+              const timeA = a.lastTimestamp?.toMillis?.() ?? 0;
+              const timeB = b.lastTimestamp?.toMillis?.() ?? 0;
+              return timeB - timeA;
+            });
+
             return (
               <React.Fragment key={user.userId}>
                 <tr
@@ -478,21 +565,68 @@ const UserTable = ({
                         <table className="min-w-full text-xs">
                           <thead className="bg-slate-50 border-b border-slate-200">
                             <tr className="text-left font-semibold text-slate-500 uppercase">
-                              <th className="px-3 py-2">Action</th>
-                              <th className="px-3 py-2">Model</th>
-                              <th className="px-3 py-2">Status</th>
-                              <th className="px-3 py-2 text-right">Img</th>
+                              <th className="px-3 py-2">Request</th>
+                              <th className="px-3 py-2">Primary Action</th>
+                              <th className="px-3 py-2 text-right">Events</th>
+                              <th className="px-3 py-2 text-right">Images</th>
                               <th className="px-3 py-2 text-right">Tok In</th>
                               <th className="px-3 py-2 text-right">Tok Out</th>
-                              <th className="px-3 py-2 text-right">Latency</th>
+                              <th className="px-3 py-2 text-right">Storage</th>
                               <th className="px-3 py-2 text-right">Cost</th>
-                              <th className="px-3 py-2">When</th>
+                              <th className="px-3 py-2">Updated</th>
                             </tr>
                           </thead>
                           <tbody>
-                            {user.events.map(event => (
-                              <UsageRow key={event.id} event={event} />
-                            ))}
+                            {requestRows.map(request => {
+                              const isRequestExpanded = expandedRequests[user.userId]?.[request.requestId];
+                              const updatedAgo = formatRelativeTime(request.lastTimestamp);
+                              return (
+                                <React.Fragment key={request.requestId}>
+                                  <tr
+                                    className="border-b border-slate-100 hover:bg-slate-50 cursor-pointer"
+                                    onClick={() => onToggleRequest(user.userId, request.requestId)}
+                                  >
+                                    <td className="px-3 py-2 font-medium text-slate-900 whitespace-nowrap">{request.requestId.slice(0, 8)}</td>
+                                    <td className="px-3 py-2 text-slate-600 whitespace-nowrap">{request.primaryAction}</td>
+                                    <td className="px-3 py-2 text-right text-slate-600">{request.totalEvents}</td>
+                                    <td className="px-3 py-2 text-right text-slate-600">{formatNumber(request.totalImages)}</td>
+                                    <td className="px-3 py-2 text-right text-slate-600">{formatNumber(request.totalTokensIn)}</td>
+                                    <td className="px-3 py-2 text-right text-slate-600">{formatNumber(request.totalTokensOut)}</td>
+                                    <td className="px-3 py-2 text-right text-slate-600">{formatBytes(request.totalStorageBytes)}</td>
+                                    <td className="px-3 py-2 text-right text-slate-600">{formatCurrency(request.totalCost)}</td>
+                                    <td className="px-3 py-2 text-slate-500 whitespace-nowrap">{updatedAgo}</td>
+                                  </tr>
+                                  {isRequestExpanded && (
+                                    <tr>
+                                      <td colSpan={9} className="px-3 py-2 bg-white">
+                                        <div className="border border-slate-200 rounded-lg overflow-hidden">
+                                          <table className="min-w-full">
+                                            <thead className="bg-slate-50 border-b border-slate-200 text-[11px] uppercase text-slate-500">
+                                              <tr>
+                                                <th className="px-3 py-2 text-left">Action</th>
+                                                <th className="px-3 py-2 text-left">Model</th>
+                                                <th className="px-3 py-2 text-left">Status</th>
+                                                <th className="px-3 py-2 text-right">Img</th>
+                                                <th className="px-3 py-2 text-right">Tok In</th>
+                                                <th className="px-3 py-2 text-right">Tok Out</th>
+                                                <th className="px-3 py-2 text-right">Latency</th>
+                                                <th className="px-3 py-2 text-right">Cost</th>
+                                                <th className="px-3 py-2 text-left">When</th>
+                                              </tr>
+                                            </thead>
+                                            <tbody>
+                                              {request.events.map(event => (
+                                                <UsageRow key={event.id} event={event} />
+                                              ))}
+                                            </tbody>
+                                          </table>
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  )}
+                                </React.Fragment>
+                              );
+                            })}
                           </tbody>
                         </table>
                       </div>

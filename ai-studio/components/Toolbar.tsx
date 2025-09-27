@@ -1,7 +1,8 @@
 
 
 import React, { useState, FormEvent } from 'react';
-import { GenerateIcon, LoadingSpinner } from './icons.tsx';
+import { GenerateIcon } from './icons.tsx';
+import { AiLoadingIndicator } from '../../components/AiLoadingIndicator.tsx';
 
 interface ToolbarProps {
   prompt: string;
@@ -110,7 +111,7 @@ const Toolbar = React.forwardRef<HTMLDivElement, ToolbarProps>(({ prompt, setPro
             disabled={isLoading || !prompt.trim()}
             className="absolute inset-y-0 right-0 m-3 flex items-center justify-center whitespace-nowrap rounded-full bg-emerald-500 px-6 text-white transition-all duration-200 hover:bg-emerald-600 hover:shadow-lg disabled:cursor-not-allowed disabled:bg-slate-300"
           >
-            {isLoading ? <LoadingSpinner /> : <GenerateIcon />}
+            {isLoading ? <AiLoadingIndicator size={36} ariaLabel="Generating" /> : <GenerateIcon />}
           </button>
         </div>
       </form>

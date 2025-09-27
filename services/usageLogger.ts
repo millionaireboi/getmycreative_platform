@@ -20,6 +20,7 @@ export interface UsageEventInput {
   subscriptionTier?: string | null;
   extra?: Record<string, unknown>;
   videoSeconds?: number;
+  requestId?: string | null;
 }
 
 const usageEventsCollection = collection(db, 'usageEvents');
@@ -43,6 +44,7 @@ export const recordUsageEvent = async (input: UsageEventInput): Promise<void> =>
       userId: input.userId ?? cachedUser?.id ?? firebaseUser?.uid ?? null,
       subscriptionTier: input.subscriptionTier ?? cachedUser?.tier ?? null,
       extra: input.extra ?? null,
+      requestId: input.requestId ?? null,
       timestamp: serverTimestamp(),
       estimatedCostUsd: estimateUsageCostUsd({
         actionType: input.actionType,

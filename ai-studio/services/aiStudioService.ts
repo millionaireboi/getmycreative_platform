@@ -18,6 +18,11 @@ const getAi = (): GoogleGenAI => {
 
 const now = () => (typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now());
 
+const generateRequestId = () =>
+    typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `req-${Math.random().toString(36).slice(2, 10)}`;
+
 const countInlineImages = (result: { candidates?: Array<{ content?: { parts?: Array<{ inlineData?: { data?: string } }> } }> }): number => {
     if (!result?.candidates) return 0;
     return result.candidates.reduce((candidateTotal, candidate) => {
@@ -37,9 +42,10 @@ const logGeminiUsage = (
         latencyMs: number;
         error?: unknown;
         extra?: Record<string, unknown>;
+        requestId?: string;
     }
 ): void => {
-    const { actionType, modelUsed, result, imageCount, status = 'success', latencyMs, error, extra } = params;
+    const { actionType, modelUsed, result, imageCount, status = 'success', latencyMs, error, extra, requestId } = params;
     const usageMetadata = result?.usageMetadata;
     const errorCode = status === 'error'
         ? (error instanceof Error ? error.message : String(error ?? 'unknown'))
@@ -56,6 +62,7 @@ const logGeminiUsage = (
         latencyMs,
         errorCode,
         extra,
+        requestId,
     });
 };
 
@@ -98,6 +105,7 @@ const fetchAsDataURL = async (url: string): Promise<string> => {
 
 export const analyzeImageContent = async (src: string): Promise<ImageAnalysis> => {
     const requestStartedAt = now();
+    const requestId = generateRequestId();
     let apiResult: any;
     let apiLatencyMs = 0;
     try {
@@ -136,6 +144,7 @@ export const analyzeImageContent = async (src: string): Promise<ImageAnalysis> =
             result: apiResult,
             imageCount: 0,
             latencyMs: apiLatencyMs,
+            requestId,
         });
         return parsed;
     } catch (error) {
@@ -151,6 +160,7 @@ export const analyzeImageContent = async (src: string): Promise<ImageAnalysis> =
             latencyMs: apiLatencyMs,
             status: 'error',
             error,
+            requestId,
         });
         return {}; // Return empty object on failure
     }
@@ -158,6 +168,7 @@ export const analyzeImageContent = async (src: string): Promise<ImageAnalysis> =
 
 export const analyzeProductImageContent = async (src: string): Promise<ProductAnalysis> => {
     const requestStartedAt = now();
+    const requestId = generateRequestId();
     let apiResult: any;
     let apiLatencyMs = 0;
     try {
@@ -194,6 +205,7 @@ export const analyzeProductImageContent = async (src: string): Promise<ProductAn
             result: apiResult,
             imageCount: 0,
             latencyMs: apiLatencyMs,
+            requestId,
         });
         return parsed;
     } catch (error) {
@@ -209,6 +221,7 @@ export const analyzeProductImageContent = async (src: string): Promise<ProductAn
             latencyMs: apiLatencyMs,
             status: 'error',
             error,
+            requestId,
         });
         return {}; // Return empty object on failure
     }
@@ -216,6 +229,7 @@ export const analyzeProductImageContent = async (src: string): Promise<ProductAn
 
 export const removeImageBackground = async (src: string): Promise<string> => {
     const requestStartedAt = now();
+    const requestId = generateRequestId();
     let apiLatencyMs = 0;
     let apiResult: any;
     try {
@@ -249,6 +263,7 @@ export const removeImageBackground = async (src: string): Promise<string> => {
                         result: apiResult,
                         imageCount: inlineImageCount,
                         latencyMs: apiLatencyMs,
+                        requestId,
                     });
                     return `data:${mimeType};base64,${base64ImageBytes}`;
                 }
@@ -269,6 +284,7 @@ export const removeImageBackground = async (src: string): Promise<string> => {
             latencyMs: apiLatencyMs,
             status: 'error',
             error,
+            requestId,
         });
         throw new Error("Failed to remove background from image.");
     }
@@ -277,6 +293,7 @@ export const removeImageBackground = async (src: string): Promise<string> => {
 
 export const analyzeTextContent = async (text: string): Promise<TextAnalysis> => {
     const requestStartedAt = now();
+    const requestId = generateRequestId();
     let apiResult: any;
     let apiLatencyMs = 0;
     try {
@@ -308,6 +325,7 @@ export const analyzeTextContent = async (text: string): Promise<TextAnalysis> =>
             imageCount: 0,
             latencyMs: apiLatencyMs,
             extra: { textLength: text.length },
+            requestId,
         });
         return parsed;
     } catch (error) {
@@ -324,6 +342,7 @@ export const analyzeTextContent = async (text: string): Promise<TextAnalysis> =>
             status: 'error',
             error,
             extra: { textLength: text.length },
+            requestId,
         });
         return {}; // Return empty object on failure
     }
@@ -339,6 +358,7 @@ export const generateVideo = async (
     }
 
     const requestStartedAt = now();
+    const requestId = generateRequestId();
     try {
         onProgress('Initiating video generation...');
         
@@ -399,7 +419,7 @@ export const generateVideo = async (
 
         const [videoUrl, posterUrl] = await Promise.all([
             fetchAsDataURL(downloadLink),
-            imageSrc ? Promise.resolve(imageSrc) : generateImage(prompt),
+            imageSrc ? Promise.resolve(imageSrc) : generateImage(prompt, { requestId }),
         ]);
 
         recordUsageEvent({
@@ -411,6 +431,7 @@ export const generateVideo = async (
             extra: {
                 providedImage: Boolean(imageSrc),
             },
+            requestId,
         });
 
         return { videoUrl, posterUrl };
@@ -429,6 +450,7 @@ export const generateVideo = async (
             extra: {
                 providedImage: Boolean(imageSrc),
             },
+            requestId,
         });
         if (isSafety) {
              throw new Error("Video generation was blocked for safety reasons. Please try a different prompt.");
@@ -445,9 +467,11 @@ const assembleCreative = async (
     assets: {
         sourceElements: CanvasElement[],
     },
-    brandInfo?: { colors?: string[]; logo?: ImageElement }
+    brandInfo?: { colors?: string[]; logo?: ImageElement },
+    requestId?: string,
 ): Promise<string> => {
     const requestStartedAt = now();
+    const localRequestId = requestId ?? generateRequestId();
     let apiResult: any;
     let apiLatencyMs = 0;
     try {
@@ -509,6 +533,7 @@ const assembleCreative = async (
                 mentionsCount: mentions.length,
                 hasBrandLogo: Boolean(brandInfo?.logo),
             },
+            requestId: localRequestId,
         });
 
         return finalImages[0];
@@ -525,13 +550,15 @@ const assembleCreative = async (
             latencyMs: apiLatencyMs || (now() - requestStartedAt),
             status: 'error',
             error,
+            requestId: localRequestId,
         });
         throw new Error("Failed to remix content.");
     }
 };
 
-export const generateImage = async (prompt: string): Promise<string> => {
+export const generateImage = async (prompt: string, options?: { requestId?: string }): Promise<string> => {
     const requestStartedAt = now();
+    const requestId = options?.requestId ?? generateRequestId();
     try {
         let finalPrompt = prompt;
         const socialMediaKeywords = ['social media', 'instagram post', 'facebook ad', 'creative', 'post', 'ad'];
@@ -559,6 +586,7 @@ export const generateImage = async (prompt: string): Promise<string> => {
                 extra: {
                     promptLength: finalPrompt.length,
                 },
+                requestId,
             });
             return `data:image/png;base64,${firstImageBytes}`;
         }
@@ -586,13 +614,19 @@ export const generateImage = async (prompt: string): Promise<string> => {
             status: 'error',
             latencyMs: now() - requestStartedAt,
             errorCode: error instanceof Error ? error.message : String(error ?? 'unknown'),
+            requestId,
         });
         throw new Error(errorMessage);
     }
 };
 
-export const generateTextVariations = async (prompt: string, style?: string): Promise<string[]> => {
+export const generateTextVariations = async (
+    prompt: string,
+    style?: string,
+    options?: { requestId?: string },
+): Promise<string[]> => {
     const requestStartedAt = now();
+    const requestId = options?.requestId ?? generateRequestId();
     let apiResult: any;
     let apiLatencyMs = 0;
     try {
@@ -630,6 +664,7 @@ export const generateTextVariations = async (prompt: string, style?: string): Pr
                 promptLength: prompt.length,
                 styleProvided: Boolean(style),
             },
+            requestId,
         });
         return result.variations as string[];
     } catch (error) {
@@ -652,13 +687,15 @@ export const generateTextVariations = async (prompt: string, style?: string): Pr
                 promptLength: prompt.length,
                 styleProvided: Boolean(style),
             },
+            requestId,
         });
         throw new Error("Failed to generate text variations.");
     }
 };
 
-const generateColorPalette = async (prompt: string): Promise<string[]> => {
+const generateColorPalette = async (prompt: string, requestId?: string): Promise<string[]> => {
     const requestStartedAt = now();
+    const localRequestId = requestId ?? generateRequestId();
     let apiResult: any;
     let apiLatencyMs = 0;
     try {
@@ -692,6 +729,7 @@ const generateColorPalette = async (prompt: string): Promise<string[]> => {
             imageCount: 0,
             latencyMs: apiLatencyMs,
             extra: { promptLength: prompt.length },
+            requestId: localRequestId,
         });
         return result.palette as string[];
     } catch (error) {
@@ -708,6 +746,7 @@ const generateColorPalette = async (prompt: string): Promise<string[]> => {
             status: 'error',
             error,
             extra: { promptLength: prompt.length },
+            requestId: localRequestId,
         });
         throw new Error("Failed to generate color palette.");
     }
@@ -719,12 +758,13 @@ export const generateBrandIdentity = async (
     textStyle: string
 ): Promise<{ logoSrc: string; colors: string[]; texts: string[] }> => {
     try {
+        const requestId = generateRequestId();
         const logoPrompt = `a minimalist flat vector logo for ${brandConcept}, on a plain white background`;
         
         const [logoSrc, colors, texts] = await Promise.all([
-            generateImage(logoPrompt),
-            generateColorPalette(palettePrompt),
-            generateTextVariations(brandConcept, textStyle)
+            generateImage(logoPrompt, { requestId }),
+            generateColorPalette(palettePrompt, requestId),
+            generateTextVariations(brandConcept, textStyle, { requestId }),
         ]);
 
         return { logoSrc, colors, texts };
@@ -743,6 +783,7 @@ export const orchestrateRemix = async (
     brandInfo?: { colors?: string[]; logo?: ImageElement },
     onProgress?: (message: string) => void
 ): Promise<string[]> => {
+    const requestId = generateRequestId();
     onProgress?.('Creative Director is analyzing the brief...');
 
     const allContentElements = sourceBoards.flatMap(b => b.elements);
@@ -829,6 +870,7 @@ export const orchestrateRemix = async (
             latencyMs: plannerLatencyMs,
             status: 'error',
             error,
+            requestId,
         });
         throw error;
     }
@@ -846,6 +888,7 @@ export const orchestrateRemix = async (
         imageCount: 0,
         latencyMs: plannerLatencyMs,
         extra: { tasksCount: plan.tasks?.length ?? 0 },
+        requestId,
     });
     
     // 3. Execution Phase
@@ -862,7 +905,8 @@ export const orchestrateRemix = async (
         return assembleCreative(
             task.prompt, // Pass the detailed, dynamic prompt from the plan
             { sourceElements: allContentElements },
-            brandInfo
+            brandInfo,
+            requestId,
         );
     });
     

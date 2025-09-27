@@ -53,6 +53,11 @@ const countInlineImages = (result: { candidates?: Array<{ content?: { parts?: Ar
   }, 0);
 };
 
+const generateRequestId = () =>
+  typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `req-${Math.random().toString(36).slice(2, 10)}`;
+
 const logGeminiUsage = (
   params: {
     actionType: string;
@@ -63,9 +68,10 @@ const logGeminiUsage = (
     latencyMs: number;
     error?: unknown;
     extra?: Record<string, unknown>;
+    requestId?: string;
   }
 ): void => {
-  const { result, actionType, modelUsed, imageCount, status = 'success', latencyMs, error, extra } = params;
+  const { result, actionType, modelUsed, imageCount, status = 'success', latencyMs, error, extra, requestId } = params;
   const usageMetadata = result?.usageMetadata;
   const errorCode = status === 'error'
     ? (error instanceof Error ? error.message : String(error ?? 'unknown'))
@@ -75,13 +81,14 @@ const logGeminiUsage = (
     actionType,
     modelUsed,
     status,
-    imageCount: typeof imageCount === 'number' ? imageCount : null,
-    inputTokenCount: usageMetadata?.promptTokenCount ?? null,
-    outputTokenCount: usageMetadata?.candidatesTokenCount ?? null,
-    totalTokenCount: usageMetadata?.totalTokenCount ?? null,
+    imageCount: typeof imageCount === 'number' ? imageCount : undefined,
+    inputTokenCount: usageMetadata?.promptTokenCount ?? undefined,
+    outputTokenCount: usageMetadata?.candidatesTokenCount ?? undefined,
+    totalTokenCount: usageMetadata?.totalTokenCount ?? undefined,
     latencyMs,
     errorCode,
     extra,
+    requestId,
   });
 };
 
@@ -367,6 +374,7 @@ export const generateCreative = async (
   const ai = getAi();
   const promptParts: any[] = [];
   const requestStartedAt = now();
+  const requestId = generateRequestId();
   let apiLatencyMs = 0;
   let apiResult: any;
   let inlineImageCount = 0;
@@ -774,6 +782,7 @@ ${newHotspotDirective ? `\n${newHotspotDirective}` : ''}${overlayReminder}
             newImageHotspots: newImageHotspots.length,
             overlayTextHotspots: overlayNewTextHotspots.length,
           },
+          requestId,
         });
         return data;
       }
@@ -797,6 +806,7 @@ ${newHotspotDirective ? `\n${newHotspotDirective}` : ''}${overlayReminder}
         newImageHotspots: newImageHotspots.length,
         overlayTextHotspots: overlayNewTextHotspots.length,
       },
+      requestId,
     });
     throw error;
   }
@@ -812,6 +822,7 @@ export const editCreativeWithChat = async (
 ): Promise<string> => {
   const ai = getAi();
   const requestStartedAt = now();
+  const requestId = generateRequestId();
   let apiLatencyMs = 0;
   let apiResult: any;
   let inlineImageCount = 0;
@@ -877,6 +888,7 @@ export const editCreativeWithChat = async (
             mentionsCount: editOptions.mentions?.length ?? 0,
             brandColorsCount: editOptions.brandColors?.length ?? 0,
           },
+          requestId,
         });
         return data; // Return the base64 of the edited image
       }
@@ -900,6 +912,7 @@ export const editCreativeWithChat = async (
         mentionsCount: editOptions.mentions?.length ?? 0,
         brandColorsCount: editOptions.brandColors?.length ?? 0,
       },
+      requestId,
     });
     throw error;
   }
@@ -908,6 +921,7 @@ export const editCreativeWithChat = async (
 export const detectEditableRegions = async (imageBase64: string, mimeType: string): Promise<Mark[]> => {
     const ai = getAi();
     const requestStartedAt = now();
+    const requestId = generateRequestId();
     let apiLatencyMs = 0;
     let apiResult: any;
     const prompt = `
@@ -1010,14 +1024,15 @@ export const detectEditableRegions = async (imageBase64: string, mimeType: strin
                 });
         }
 
-        logGeminiUsage({
-            actionType: 'detectEditableRegions',
-            modelUsed: 'gemini-2.5-flash',
-            result: apiResult,
-            imageCount: 0,
-            latencyMs: apiLatencyMs,
-            extra: { detectedRegions: regions.length },
-        });
+            logGeminiUsage({
+                actionType: 'detectEditableRegions',
+                modelUsed: 'gemini-2.5-flash',
+                result: apiResult,
+                imageCount: 0,
+                latencyMs: apiLatencyMs,
+                extra: { detectedRegions: regions.length },
+                requestId,
+            });
 
         return regions;
     } catch (error) {
@@ -1032,6 +1047,7 @@ export const detectEditableRegions = async (imageBase64: string, mimeType: strin
             latencyMs: apiLatencyMs,
             status: 'error',
             error,
+            requestId,
         });
         throw error;
     }
@@ -1043,6 +1059,7 @@ export const generateTemplateMetadata = async (
 ): Promise<{ title: string; prompt: string; tags: string[]; useCases: string[] }> => {
     const ai = getAi();
     const requestStartedAt = now();
+    const requestId = generateRequestId();
     let apiLatencyMs = 0;
     let apiResult: any;
     const prompt = `
@@ -1119,6 +1136,7 @@ export const generateTemplateMetadata = async (
                 imageCount: 0,
                 latencyMs: apiLatencyMs,
                 extra: { tagsCount: payload.tags.length, useCasesCount: payload.useCases.length },
+                requestId,
             });
 
             return payload;
@@ -1137,6 +1155,7 @@ export const generateTemplateMetadata = async (
             latencyMs: apiLatencyMs,
             status: 'error',
             error,
+            requestId,
         });
         throw error;
     }
@@ -1146,6 +1165,7 @@ export const generateTemplateMetadata = async (
 export const extractColorsFromImage = async (imageBase64: string, mimeType: string): Promise<string[]> => {
     const ai = getAi();
     const requestStartedAt = now();
+    const requestId = generateRequestId();
     let apiLatencyMs = 0;
     let apiResult: any;
     const prompt = `
@@ -1201,6 +1221,7 @@ export const extractColorsFromImage = async (imageBase64: string, mimeType: stri
                 imageCount: 0,
                 latencyMs: apiLatencyMs,
                 extra: { colorsCount: colors.length },
+                requestId,
             });
             return colors;
         }
@@ -1218,6 +1239,7 @@ export const extractColorsFromImage = async (imageBase64: string, mimeType: stri
             latencyMs: apiLatencyMs,
             status: 'error',
             error,
+            requestId,
         });
         throw error;
     }
@@ -1230,6 +1252,7 @@ export const generateTemplateStyleSnapshot = async (
 ): Promise<TemplateStyleSnapshot> => {
   const ai = getAi();
   const requestStartedAt = now();
+  const requestId = generateRequestId();
   let apiLatencyMs = 0;
   let apiResult: any;
   const prompt = `
@@ -1348,6 +1371,7 @@ export const generateTemplateStyleSnapshot = async (
         typographyCount: typography.length,
         motifCount: motifKeywords.length,
       },
+      requestId,
     });
 
     return {
@@ -1373,6 +1397,7 @@ export const generateTemplateStyleSnapshot = async (
       latencyMs: apiLatencyMs,
       status: 'error',
       error,
+      requestId,
     });
     throw error;
   }
@@ -1382,6 +1407,7 @@ export const generateHotspotAsset = async (request: HotspotAssetRequest): Promis
   const ai = getAi();
   const { styleSnapshot, intent, hotspotLabel } = request;
   const requestStartedAt = now();
+  const requestId = generateRequestId();
 
   const paletteText = styleSnapshot.palette.join(', ');
   const accentText = styleSnapshot.accentPalette?.join(', ');
@@ -1591,6 +1617,7 @@ ${transparencyDirective}`
               ...lastExtra,
               deliveredAlpha: true,
             },
+            requestId,
           });
           return { base64: data, mimeType, hasAlpha };
         }
@@ -1609,6 +1636,7 @@ ${transparencyDirective}`
               ...lastExtra,
               deliveredAlpha: false,
             },
+            requestId,
           });
           return fallbackOpaque;
         }
@@ -1624,6 +1652,7 @@ ${transparencyDirective}`
             ...lastExtra,
             deliveredAlpha: false,
           },
+          requestId,
         });
         continue;
       }
@@ -1643,6 +1672,7 @@ ${transparencyDirective}`
           forceTransparent,
           intent,
         },
+        requestId,
       });
       throw error;
     }
@@ -1661,6 +1691,7 @@ ${transparencyDirective}`
       ...(lastExtra ?? {}),
       intent,
     },
+    requestId,
   });
   throw finalError;
 };
@@ -1678,6 +1709,7 @@ export const generativeFill = async (request: GenerativeFillRequest): Promise<Ge
   }
 
   const requestStartedAt = now();
+  const requestId = generateRequestId();
   const maskBytes = Math.floor((request.maskBase64.length * 3) / 4);
   const baseImageBytes = request.baseImageBase64 ? Math.floor((request.baseImageBase64.length * 3) / 4) : 0;
 
@@ -1710,6 +1742,7 @@ export const generativeFill = async (request: GenerativeFillRequest): Promise<Ge
           maskBytes,
           baseImageBytes,
         },
+        requestId,
       });
       throw new Error(message);
     }
@@ -1728,6 +1761,7 @@ export const generativeFill = async (request: GenerativeFillRequest): Promise<Ge
           maskBytes,
           baseImageBytes,
         },
+        requestId,
       });
       throw new Error(errorMessage);
     }
@@ -1742,6 +1776,7 @@ export const generativeFill = async (request: GenerativeFillRequest): Promise<Ge
         baseImageBytes,
         brandColorsCount: request.brandColors?.length ?? 0,
       },
+      requestId,
     });
 
     return { base64, mimeType };
@@ -1758,6 +1793,7 @@ export const generativeFill = async (request: GenerativeFillRequest): Promise<Ge
         baseImageBytes,
         brandColorsCount: request.brandColors?.length ?? 0,
       },
+      requestId,
     });
     throw error;
   }
@@ -1766,6 +1802,7 @@ export const generativeFill = async (request: GenerativeFillRequest): Promise<Ge
 export const getTagsForSearchQuery = async (query: string): Promise<string[]> => {
     const ai = getAi();
     const requestStartedAt = now();
+    const requestId = generateRequestId();
     let apiLatencyMs = 0;
     let apiResult: any;
     const prompt = `
@@ -1815,6 +1852,7 @@ export const getTagsForSearchQuery = async (query: string): Promise<string[]> =>
                 status: 'error',
                 error: new Error('Empty response'),
                 extra: { queryLength: query.length },
+                requestId,
             });
             return [];
         }
@@ -1831,6 +1869,7 @@ export const getTagsForSearchQuery = async (query: string): Promise<string[]> =>
             imageCount: 0,
             latencyMs: apiLatencyMs,
             extra: { tagsCount: tags.length, queryLength: query.length },
+            requestId,
         });
 
         return tags;
@@ -1847,6 +1886,7 @@ export const getTagsForSearchQuery = async (query: string): Promise<string[]> =>
             status: 'error',
             error,
             extra: { queryLength: query.length },
+            requestId,
         });
         throw error;
     }

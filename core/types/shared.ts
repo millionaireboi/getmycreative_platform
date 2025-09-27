@@ -14,6 +14,8 @@ export interface GeneratedImage {
   imageUrl: string;
   prompt: string;
   initialMarks?: Mark[]; // Hotspot snapshot captured when this version was rendered
+  errorReason?: string; // Optional failure reason when generation is blocked
+  raiReason?: string; // Optional Responsible AI block reason surfaced by the API
 }
 
 export type MarkCategory = 'content' | 'decorative' | 'silhouette' | 'background';

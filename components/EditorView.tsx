@@ -5,6 +5,7 @@ import { generateCreative, editCreativeWithChat, ChatEditOptions, generateHotspo
 import { fileToBase64, downloadImage, imageUrlToBase64, base64ToBlob, blobToBase64 } from '../utils/fileUtils.ts';
 import { SparklesIcon, ArrowLeftIcon, DownloadIcon, PaperclipIcon, SendIcon, PaletteIcon, XIcon, UploadCloudIcon, EditIcon, FileTextIcon, ImageIcon } from './icons.tsx';
 import CreativeElement from './CreativeElement.tsx';
+import { AiLoadingIndicator } from './AiLoadingIndicator.tsx';
 
 import { BRAND_PALETTES } from '../constants.ts';
 import { useAuth } from '../contexts/AuthContext.tsx';
@@ -1127,7 +1128,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     setFillPath([]);
   }, []);
 
-  const clearFillSelection = useCallback(() => {
+  const resetGenerativeFillSelection = useCallback(() => {
     resetFillDrawingState();
     setFillRegion([]);
     setDraftFillMask(null);
@@ -1136,10 +1137,10 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
 
   useEffect(() => {
     if (!generativeFillSupported) {
-      clearFillSelection();
+      resetGenerativeFillSelection();
       setIsDrawingFill(false);
     }
-  }, [generativeFillSupported, clearFillSelection]);
+  }, [generativeFillSupported, resetGenerativeFillSelection]);
 
   const handleAssetPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>, asset: HotspotAssetPlacement) => {
     event.preventDefault();
@@ -1823,7 +1824,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
       }
 
       if (hasFillRequest) {
-        clearFillSelection();
+        resetGenerativeFillSelection();
       }
 
       const assistantMessage: ChatMessage = {
@@ -1876,7 +1877,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
     fillPrompt,
     generativeFill,
     blobToBase64,
-    clearFillSelection,
+    resetGenerativeFillSelection,
   ]);
 
   const handleGenerateClick = useCallback(() => {
@@ -2319,7 +2320,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
         const message = error instanceof Error ? error.message : 'Failed to create the fill mask.';
         const errorMsg: ChatMessage = { id: `fill-error-${Date.now()}`, role: 'assistant', type: 'error', text: message };
         setChatMessages(prev => [...prev, errorMsg]);
-        clearFillSelection();
+        resetGenerativeFillSelection();
       }
       return;
     }
@@ -2418,7 +2419,17 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
               disabled ? 'bg-emerald-500/60 text-white/80 cursor-not-allowed' : 'bg-emerald-500 text-white hover:bg-emerald-400'
             }`}
           >
-            {isGenerating ? (generationStatus ?? 'Generating…') : (<><SparklesIcon className="h-5 w-5" />Generate creative</>)}
+            {isGenerating ? (
+              <span className="flex items-center justify-center gap-2">
+                <AiLoadingIndicator size={32} ariaLabel="Generating creative" />
+                <span>{generationStatus ?? 'Generating…'}</span>
+              </span>
+            ) : (
+              <>
+                <SparklesIcon className="h-5 w-5" />
+                Generate creative
+              </>
+            )}
           </button>
           <button
             onClick={handleRenderComposite}
@@ -2892,17 +2903,10 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                         </div>
                     ))}
                     {isGenerating && (
-                        <div className="flex gap-3 text-sm text-gray-500">
-                            <div className="flex h-7 w-7 items-center justify-center rounded-full bg-emerald-100"><SparklesIcon className="h-4 w-4 text-emerald-500 animate-spin" /></div>
-                            <div className="flex items-center gap-2">
-                                <div className="flex items-center gap-1">
-                                    <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" style={{ animationDelay: '0s' }}></span>
-                                    <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" style={{ animationDelay: '0.15s' }}></span>
-                                    <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" style={{ animationDelay: '0.3s' }}></span>
-                                </div>
-                                <span>{generationStatus ?? 'Working on it…'}</span>
-                            </div>
-                        </div>
+                      <div className="flex items-center gap-3 rounded-2xl bg-emerald-50/60 p-2 text-sm text-emerald-700">
+                        <AiLoadingIndicator size={40} ariaLabel="Designer bot is working" />
+                        <span>{generationStatus ?? 'Working on it…'}</span>
+                      </div>
                     )}
                     <div ref={messagesEndRef} />
                 </div>
@@ -3197,7 +3201,7 @@ export const EditorView = ({ project, pendingTemplate, onBack, onUpgrade, isDemo
                 <button
                   type="button"
                   onClick={() => {
-                    clearFillSelection();
+                    resetGenerativeFillSelection();
                     setIsDrawingFill(true);
                   }}
                   className="text-xs font-semibold text-emerald-600 hover:text-emerald-700"
